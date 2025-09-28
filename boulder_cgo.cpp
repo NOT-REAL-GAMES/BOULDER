@@ -43,10 +43,20 @@ int boulder_init() {
     if (g_engine.initialized) {
         return 0;
     }
-
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    
+    // Try to initialize SDL with just events first
+    if (!SDL_Init(SDL_INIT_EVENTS)) {
+        std::cerr << "[ERROR] SDL_Init EVENTS failed: " << SDL_GetError() << std::endl;
         return -1;
     }
+
+    // Try to add video subsystem
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        std::cerr << "[ERROR] SDL_InitSubSystem VIDEO failed: " << SDL_GetError() << std::endl;
+        std::cerr << "[INFO] Continuing without video subsystem..." << std::endl;
+        // Don't return -1, continue without video
+    }
+    
 
     g_engine.ecs = new flecs::world();
     g_engine.importer = std::make_unique<Assimp::Importer>();
@@ -59,6 +69,8 @@ void boulder_shutdown() {
     if (!g_engine.initialized) {
         return;
     }
+
+    std::cerr << "[INFO] Shutting down engine..." << std::endl;
 
     if (g_engine.window) {
         SDL_DestroyWindow(g_engine.window);
@@ -106,6 +118,9 @@ int boulder_create_window(int width, int height, const char* title) {
         return -1;
     }
 
+    std::cerr << "[INFO] Window creation: " << width << "x" << height << " '" << title << "'" << std::endl;
+
+    
     if (g_engine.window) {
         SDL_DestroyWindow(g_engine.window);
     }
@@ -117,6 +132,7 @@ int boulder_create_window(int width, int height, const char* title) {
     );
 
     return g_engine.window ? 0 : -1;
+    
 }
 
 void boulder_set_window_size(int width, int height) {

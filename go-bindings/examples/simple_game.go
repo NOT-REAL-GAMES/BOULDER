@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	boulder "github.com/boulder/go-bindings"
+	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
 func main() {
@@ -141,7 +141,7 @@ func main() {
 
 		// Cap frame rate at ~60 FPS
 		if deltaTime < 0.016 {
-			time.Sleep(time.Duration((0.016 - deltaTime) * 1000) * time.Millisecond)
+			time.Sleep(time.Duration((0.016-deltaTime)*1000) * time.Millisecond)
 		}
 	}
 

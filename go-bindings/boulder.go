@@ -1,7 +1,7 @@
 package boulder
 
 // #cgo CFLAGS: -I..
-// #cgo LDFLAGS: -L../build -lboulder_shared -Wl,-rpath,../build
+// #cgo LDFLAGS: -L../build -lboulder_shared -Wl,-rpath,${SRCDIR}/../build
 // #include <stdlib.h>
 // #include "../boulder_cgo.h"
 import "C"
