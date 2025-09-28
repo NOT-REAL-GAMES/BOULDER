@@ -1,0 +1,171 @@
+cmake_minimum_required(VERSION 3.25)
+project(Boulder VERSION 0.0.1 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS ON)
+
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+find_package(SDL2 QUIET)
+find_package(Vulkan QUIET)
+find_package(Threads REQUIRED)
+
+include(FetchContent)
+
+FetchContent_Declare(
+    glm STATIC
+    GIT_REPOSITORY "https://github.com/g-truc/glm.git"
+)
+
+FetchContent_MakeAvailable(glm)
+
+FetchContent_Declare(
+    SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG "main"
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(SDL3)
+
+FetchContent_Declare(
+    volk
+    GIT_REPOSITORY https://github.com/zeux/volk.git
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(volk)
+
+
+FetchContent_Declare(
+    flecs
+    GIT_REPOSITORY https://github.com/SanderMertens/flecs.git
+    GIT_TAG v4.0.3
+)
+FetchContent_MakeAvailable(flecs)
+
+# Add Jolt Physics using FetchContent
+FetchContent_Declare(
+    Jolt
+    GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+    GIT_TAG v5.3.0
+    SOURCE_SUBDIR Build
+)
+
+# Configure Jolt options before making it available
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+set(ENABLE_OBJECT_STREAM ON CACHE BOOL "" FORCE)
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+set(GENERATE_DEBUG_SYMBOLS ON CACHE BOOL "" FORCE)
+set(OVERRIDE_CXX_FLAGS OFF CACHE BOOL "" FORCE)
+set(DOUBLE_PRECISION ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(Jolt)
+
+# Ensure Jolt uses the correct C++ standard
+if(TARGET Jolt)
+    set_target_properties(Jolt PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+endif()
+
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG asio-1-29-0
+)
+FetchContent_MakeAvailable(asio)
+
+# Note: gofrontend is a GCC compiler frontend for Go, not a library
+# If you need Go language support in your engine, consider:
+# 1. Using CGO to create Go bindings for your C++ engine
+# 2. Using a Go embedding library if you need scripting
+# 3. Creating a separate Go module that interfaces with your engine
+#
+# For now, commenting out the incorrect gofrontend integration:
+# FetchContent_Declare(
+#     golang
+#     GIT_REPOSITORY https://github.com/golang/gofrontend.git
+# )
+# FetchContent_MakeAvailable(golang)
+
+FetchContent_Declare(
+    assimp
+    GIT_REPOSITORY https://github.com/assimp/assimp
+)
+FetchContent_MakeAvailable(assimp)
+
+
+
+# Set position independent code for all targets when building shared library
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Build shared library for CGO bindings
+add_library(boulder_shared SHARED
+    boulder_cgo.cpp
+)
+
+target_include_directories(boulder_shared PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${asio_SOURCE_DIR}/asio/include
+)
+
+# Find zlib as a shared library
+find_package(ZLIB REQUIRED)
+
+target_link_libraries(boulder_shared PUBLIC
+    SDL3
+    Threads::Threads
+    assimp
+    flecs::flecs_static
+    Jolt
+    volk
+    glm::glm
+    ZLIB::ZLIB
+)
+
+target_compile_definitions(boulder_shared PUBLIC
+    USING_VULKAN
+    VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+    HAS_ASSIMP
+    JPH_DOUBLE_PRECISION
+)
+
+# Set shared library properties for CGO
+set_target_properties(boulder_shared PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET default
+    CXX_VISIBILITY_PRESET default
+)
+
+# Build main executable
+add_executable(Boulder
+    main.cpp
+)
+
+target_include_directories(Boulder PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(Boulder PRIVATE
+    SDL3
+    Threads::Threads
+    assimp
+    flecs::flecs_static
+    Jolt
+    volk
+    glm::glm
+)
+
+target_compile_definitions(Boulder PRIVATE
+    USING_VULKAN
+    VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+    HAS_ASSIMP
+    JPH_DOUBLE_PRECISION
+)
