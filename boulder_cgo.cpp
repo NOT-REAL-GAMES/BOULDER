@@ -1,3 +1,5 @@
+
+#include "main.h"
 #include "boulder_cgo.h"
 #include <iostream>
 #include <memory>
@@ -8,6 +10,7 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include "volk.h"
 
 // Global state for the engine
 static struct {
@@ -39,27 +42,47 @@ struct Model {
 
 extern "C" {
 
-int boulder_init() {
+int boulder_init(const char* appName) {
     if (g_engine.initialized) {
         return 0;
     }
     
     // Try to initialize SDL with just events first
     if (!SDL_Init(SDL_INIT_EVENTS)) {
-        std::cerr << "[ERROR] SDL_Init EVENTS failed: " << SDL_GetError() << std::endl;
+        Logger::get().error( "SDL_Init EVENTS failed: {}", SDL_GetError());
         return -1;
     }
 
     // Try to add video subsystem
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
-        std::cerr << "[ERROR] SDL_InitSubSystem VIDEO failed: " << SDL_GetError() << std::endl;
-        std::cerr << "[INFO] Continuing without video subsystem..." << std::endl;
+        Logger::get().error("SDL_InitSubSystem VIDEO failed: {}", SDL_GetError());
+        Logger::get().info("Continuing without video subsystem...");
         // Don't return -1, continue without video
     }
     
 
     g_engine.ecs = new flecs::world();
     g_engine.importer = std::make_unique<Assimp::Importer>();
+
+    VkResult err;
+
+    if ( (err = volkInitialize()) != VK_SUCCESS) {
+        Logger::get().error("Volk initialization failed! {}", (int)err);
+        return -1;
+    } else {
+        Logger::get().info("Volk initialization successful!");
+    }
+
+    VkApplicationInfo appInfo{};
+
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = appName;
+    appInfo.applicationVersion = VK_MAKE_VERSION(0, 0, 1);
+    appInfo.pEngineName = "Boulder Engine";
+    appInfo.engineVersion = VK_MAKE_VERSION(0, 0, 1);
+    appInfo.apiVersion = VK_API_VERSION_1_4;  // Targeting Vulkan 1.4
+
+
     g_engine.initialized = true;
 
     return 0;
@@ -70,7 +93,7 @@ void boulder_shutdown() {
         return;
     }
 
-    std::cerr << "[INFO] Shutting down engine..." << std::endl;
+    Logger::get().info("Shutting down engine...");
 
     if (g_engine.window) {
         SDL_DestroyWindow(g_engine.window);
@@ -118,7 +141,7 @@ int boulder_create_window(int width, int height, const char* title) {
         return -1;
     }
 
-    std::cerr << "[INFO] Window creation: " << width << "x" << height << " '" << title << "'" << std::endl;
+    Logger::get().info("Window creation: {} x {} '{}'" , width, height, title);
 
     
     if (g_engine.window) {
@@ -343,13 +366,13 @@ void boulder_get_mouse_position(float* x, float* y) {
 
 void boulder_log_info(const char* message) {
     if (message) {
-        std::cout << "[INFO] " << message << std::endl;
+        Logger::get().info("{}",message);
     }
 }
 
 void boulder_log_error(const char* message) {
     if (message) {
-        std::cerr << "[ERROR] " << message << std::endl;
+        Logger::get().error("{}",message);
     }
 }
 

@@ -10,7 +10,7 @@ import (
 
 func main() {
 	// Create and initialize the engine
-	engine := boulder.NewEngine()
+	engine := boulder.NewEngine("Wee", vkMakeVersion(0, 0, 1))
 
 	boulder.LogInfo("Starting Boulder Engine from Go!")
 
@@ -140,9 +140,9 @@ func main() {
 		}
 
 		// Cap frame rate at ~60 FPS
-		if deltaTime < 0.016 {
-			time.Sleep(time.Duration((0.016-deltaTime)*1000) * time.Millisecond)
-		}
+		//if deltaTime < 0.016 {
+		//	time.Sleep(time.Duration((0.016-deltaTime)*1000) * time.Millisecond)
+		//}
 	}
 
 	boulder.LogInfo("Shutting down...")

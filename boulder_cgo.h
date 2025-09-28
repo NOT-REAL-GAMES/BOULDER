@@ -6,7 +6,7 @@ extern "C" {
 #endif
 
 // Engine initialization and lifecycle
-int boulder_init();
+int boulder_init(const char* appName);
 void boulder_shutdown();
 int boulder_update(float deltaTime);
 int boulder_render();

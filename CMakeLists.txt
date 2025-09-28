@@ -34,7 +34,13 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/zeux/volk.git
     GIT_SHALLOW TRUE
 )
+
+# Configure volk with position independent code before making it available
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 FetchContent_MakeAvailable(volk)
+
+# Ensure volk library has PIC enabled
+set_target_properties(volk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 
 FetchContent_Declare(

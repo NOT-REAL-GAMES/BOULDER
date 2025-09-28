@@ -20,12 +20,18 @@ type Vector3 struct {
 
 // Engine represents the Boulder game engine
 type Engine struct {
+	appName     string
+	version     uint32
 	initialized bool
 }
 
+func vkMakeVersion(major, minor, patch uint32) uint32 {
+	return uint32(major<<22 | minor<<12 | patch)
+}
+
 // NewEngine creates a new Engine instance
-func NewEngine() *Engine {
-	return &Engine{}
+func NewEngine(appName string, ver uint32) *Engine {
+	return &Engine{appName: appName, version: ver}
 }
 
 // Init initializes the Boulder engine
@@ -34,7 +40,7 @@ func (e *Engine) Init() error {
 		return errors.New("engine already initialized")
 	}
 
-	if ret := C.boulder_init(); ret != 0 {
+	if ret := C.boulder_init(&e.appName); ret != 0 {
 		return errors.New("failed to initialize engine")
 	}
 
