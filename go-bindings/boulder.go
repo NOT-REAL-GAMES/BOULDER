@@ -25,10 +25,6 @@ type Engine struct {
 	initialized bool
 }
 
-func vkMakeVersion(major, minor, patch uint32) uint32 {
-	return uint32(major<<22 | minor<<12 | patch)
-}
-
 // NewEngine creates a new Engine instance
 func NewEngine(appName string, ver uint32) *Engine {
 	return &Engine{appName: appName, version: ver}
@@ -40,7 +36,7 @@ func (e *Engine) Init() error {
 		return errors.New("engine already initialized")
 	}
 
-	if ret := C.boulder_init(&e.appName); ret != 0 {
+	if ret := C.boulder_init(C.CString(e.appName)); ret != 0 {
 		return errors.New("failed to initialize engine")
 	}
 
@@ -56,6 +52,10 @@ func (e *Engine) Shutdown() {
 
 	C.boulder_shutdown()
 	e.initialized = false
+}
+
+func (e *Engine) GetAppName() string {
+	return e.appName
 }
 
 // Update updates the engine with the given delta time

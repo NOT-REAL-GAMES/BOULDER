@@ -8,9 +8,13 @@ import (
 	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
+func vkMakeVersion(major, minor, patch uint32) uint32 {
+	return uint32(major<<22 | minor<<12 | patch)
+}
+
 func main() {
 	// Create and initialize the engine
-	engine := boulder.NewEngine("Wee", vkMakeVersion(0, 0, 1))
+	engine := boulder.NewEngine("YOUR GAME NAME HERE", vkMakeVersion(0, 0, 1))
 
 	boulder.LogInfo("Starting Boulder Engine from Go!")
 
@@ -20,7 +24,7 @@ func main() {
 	defer engine.Shutdown()
 
 	// Create a window
-	if err := engine.CreateWindow(1280, 720, "Boulder Engine - Go Example"); err != nil {
+	if err := engine.CreateWindow(1280, 720, engine.GetAppName()); err != nil {
 		log.Fatalf("Failed to create window: %v", err)
 	}
 
