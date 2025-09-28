@@ -42,7 +42,7 @@ struct Model {
 
 extern "C" {
 
-int boulder_init(const char* appName) {
+int boulder_init(const char* appName, Uint32 version) {
     if (g_engine.initialized) {
         return 0;
     }
@@ -77,7 +77,7 @@ int boulder_init(const char* appName) {
 
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = appName;
-    appInfo.applicationVersion = VK_MAKE_VERSION(0, 0, 1);
+    appInfo.applicationVersion = version;
     appInfo.pEngineName = "Boulder Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(0, 0, 1);
     appInfo.apiVersion = VK_API_VERSION_1_4;  // Targeting Vulkan 1.4
