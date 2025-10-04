@@ -36,7 +36,7 @@ func (e *Engine) Init() error {
 		return errors.New("engine already initialized")
 	}
 
-	if ret := C.boulder_init(C.CString(e.appName), e.version); ret != 0 {
+	if ret := C.boulder_init(C.CString(e.appName), C.uint(e.version)); ret != 0 {
 		return errors.New("failed to initialize engine")
 	}
 
