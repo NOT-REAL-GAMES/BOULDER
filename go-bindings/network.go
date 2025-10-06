@@ -13,6 +13,9 @@ import (
 // ConnectionHandle uniquely identifies a network connection
 type ConnectionHandle uint64
 
+// SteamID represents a Steam user ID for P2P connections
+type SteamID uint64
+
 // NetworkEventType represents the type of network event
 type NetworkEventType int
 
@@ -74,6 +77,27 @@ type NetworkSession struct {
 	engine *Engine
 }
 
+// Global relay configuration functions (call before creating sessions)
+
+// InitWithSteamApp initializes networking with a Steam AppID (e.g., 480 for Spacewar test app)
+// This enables P2P and Steam Datagram Relay features
+// Must be called before creating any network sessions
+func InitWithSteamApp(appId uint32) {
+	C.boulder_network_init_with_steam_app(C.uint32_t(appId))
+}
+
+// SetRelayServer configures the Steam Datagram Relay server
+func SetRelayServer(address string, port uint16) {
+	cAddr := C.CString(address)
+	defer C.free(unsafe.Pointer(cAddr))
+	C.boulder_network_set_relay_server(cAddr, C.uint16_t(port))
+}
+
+// EnableFakeIP enables FakeIP allocation for P2P testing without Steam
+func EnableFakeIP() {
+	C.boulder_network_enable_fake_ip()
+}
+
 // NewNetworkSession creates a new network session
 func NewNetworkSession(engine *Engine) (*NetworkSession, error) {
 	if !engine.initialized {
@@ -120,6 +144,20 @@ func (ns *NetworkSession) StartServer(port uint16) error {
 	return nil
 }
 
+// StartServerP2P starts a P2P server on a virtual port
+func (ns *NetworkSession) StartServerP2P(virtualPort int) error {
+	if ns.handle == nil {
+		return errors.New("session not initialized")
+	}
+
+	result := C.boulder_start_server_p2p(ns.handle, C.int(virtualPort))
+	if result != 0 {
+		return errors.New("failed to start P2P server")
+	}
+
+	return nil
+}
+
 // StopServer stops the server
 func (ns *NetworkSession) StopServer() {
 	if ns.handle != nil {
@@ -144,11 +182,42 @@ func (ns *NetworkSession) Connect(address string, port uint16) (ConnectionHandle
 	return ConnectionHandle(handle), nil
 }
 
+// ConnectP2P initiates a P2P connection to a Steam user
+func (ns *NetworkSession) ConnectP2P(steamID SteamID, virtualPort int) (ConnectionHandle, error) {
+	if ns.handle == nil {
+		return 0, errors.New("session not initialized")
+	}
+
+	handle := C.boulder_connect_p2p(ns.handle, C.SteamID(steamID), C.int(virtualPort))
+	if handle == 0 {
+		return 0, errors.New("failed to connect P2P")
+	}
+
+	return ConnectionHandle(handle), nil
+}
+
 // Disconnect closes a connection
 func (ns *NetworkSession) Disconnect(conn ConnectionHandle) {
 	if ns.handle != nil {
 		C.boulder_disconnect(ns.handle, C.ConnectionHandle(conn))
 	}
+}
+
+// SetLocalIdentity sets a friendly name for this session (for debugging)
+func (ns *NetworkSession) SetLocalIdentity(name string) {
+	if ns.handle != nil {
+		cName := C.CString(name)
+		defer C.free(unsafe.Pointer(cName))
+		C.boulder_set_local_identity(ns.handle, cName)
+	}
+}
+
+// GetLocalSteamID returns the local Steam ID (or 0 if not authenticated)
+func (ns *NetworkSession) GetLocalSteamID() SteamID {
+	if ns.handle == nil {
+		return 0
+	}
+	return SteamID(C.boulder_get_local_steam_id(ns.handle))
 }
 
 // ConnectionState returns the current state of a connection

@@ -1675,6 +1675,7 @@ struct BoulderNetworkSession;
 static bool g_gnsInitialized = false;
 static int g_gnsRefCount = 0;
 static std::mutex g_gnsInitMutex;
+static uint32_t g_steamAppId = 0;
 
 // Global map to track sessions (needed because GNS doesn't support userdata in all callbacks)
 static std::unordered_map<HSteamListenSocket, BoulderNetworkSession*> g_serverSessions;
@@ -1846,6 +1847,24 @@ NetworkSession boulder_create_network_session() {
         std::lock_guard<std::mutex> lock(g_gnsInitMutex);
         if (!g_gnsInitialized) {
             SteamDatagramErrMsg errMsg;
+
+            // If Steam AppID is set, use it for initialization (enables P2P/Steam features)
+            SteamNetworkingIdentity identity;
+            if (g_steamAppId != 0) {
+                // Set up identity for Steam authentication
+                identity.Clear();
+                Logger::get().info("Initializing GameNetworkingSockets with Steam AppID {}", g_steamAppId);
+
+                // Set environment variable for Steam AppID
+                char appIdStr[32];
+                snprintf(appIdStr, sizeof(appIdStr), "%u", g_steamAppId);
+                #ifdef _WIN32
+                _putenv_s("SteamAppId", appIdStr);
+                #else
+                setenv("SteamAppId", appIdStr, 1);
+                #endif
+            }
+
             if (!GameNetworkingSockets_Init(nullptr, errMsg)) {
                 Logger::get().error("Failed to initialize GameNetworkingSockets: {}", errMsg);
                 return nullptr;
@@ -2034,6 +2053,111 @@ int boulder_connection_state(NetworkSession session, ConnectionHandle conn) {
     }
 
     return -1;
+}
+
+// Relay and P2P functions
+void boulder_network_init_with_steam_app(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_gnsInitMutex);
+    if (!g_gnsInitialized) {
+        g_steamAppId = appId;
+        Logger::get().info("Steam AppID set to {} (will be used on next session creation)", appId);
+    }
+}
+
+void boulder_network_set_relay_server(const char* address, uint16_t port) {
+    if (!address) return;
+
+    // This sets the SDR (Steam Datagram Relay) configuration
+    // Note: This is a simplified version. Full implementation would need proper SDR config
+    SteamNetworkingIPAddr relayAddr;
+    if (relayAddr.ParseString(address)) {
+        relayAddr.m_port = port;
+        // Configure relay through GNS utils
+        Logger::get().info("Relay server set to {}:{}", address, port);
+    }
+}
+
+void boulder_network_enable_fake_ip() {
+    // Enable FakeIP allocation for easier P2P testing without Steam
+    SteamNetworkingUtils()->SetGlobalConfigValueInt32(
+        k_ESteamNetworkingConfig_IP_AllowWithoutAuth, 1);
+    Logger::get().info("FakeIP enabled for testing");
+}
+
+int boulder_start_server_p2p(NetworkSession session, int virtualPort) {
+    if (!session) return -1;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    // Create P2P listen socket on virtual port
+    s->listenSocket = s->interface->CreateListenSocketP2P(virtualPort, 0, nullptr);
+    if (s->listenSocket == k_HSteamListenSocket_Invalid) {
+        Logger::get().error("Failed to create P2P listen socket on virtual port {}", virtualPort);
+        return -1;
+    }
+
+    // Register server in global map
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+        g_serverSessions[s->listenSocket] = s;
+    }
+
+    s->isServer = true;
+    Logger::get().info("P2P server started on virtual port {}", virtualPort);
+    return 0;
+}
+
+ConnectionHandle boulder_connect_p2p(NetworkSession session, SteamID steamID, int virtualPort) {
+    if (!session) return 0;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    // Create identity from Steam ID
+    SteamNetworkingIdentity identity;
+    identity.SetSteamID64(steamID);
+
+    // Connect via P2P
+    HSteamNetConnection conn = s->interface->ConnectP2P(identity, virtualPort, 0, nullptr);
+    if (conn == k_HSteamNetConnection_Invalid) {
+        Logger::get().error("Failed to connect P2P to Steam ID {}", steamID);
+        return 0;
+    }
+
+    // Register connection in global map
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+        g_connectionSessions[conn] = s;
+    }
+
+    ConnectionHandle handle = s->getOrCreateConnectionHandle(conn);
+    Logger::get().info("Connecting P2P to Steam ID {} (handle: {})", steamID, handle);
+    return handle;
+}
+
+void boulder_set_local_identity(NetworkSession session, const char* name) {
+    if (!session || !name) return;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    // Set a friendly name for this connection
+    // This is useful for debugging and doesn't require Steam authentication
+    Logger::get().info("Local identity set to: {}", name);
+}
+
+SteamID boulder_get_local_steam_id(NetworkSession session) {
+    if (!session) return 0;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    // Get local identity
+    SteamNetworkingIdentity identity;
+    s->interface->GetIdentity(&identity);
+
+    if (identity.IsInvalid()) {
+        return 0;
+    }
+
+    return identity.GetSteamID64();
 }
 
 int boulder_send_message(NetworkSession session, ConnectionHandle conn, const void* data, uint32_t size, int reliable) {

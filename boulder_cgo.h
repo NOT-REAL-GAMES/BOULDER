@@ -79,20 +79,32 @@ int boulder_recreate_swapchain();
 // Network management
 typedef void* NetworkSession;
 typedef uint64_t ConnectionHandle;
+typedef uint64_t SteamID;
 
 // Session lifecycle
 NetworkSession boulder_create_network_session();
 void boulder_destroy_network_session(NetworkSession session);
 void boulder_network_update(NetworkSession session);
 
+// Relay configuration (call before creating sessions)
+void boulder_network_init_with_steam_app(uint32_t appId); // Initialize with Steam AppID (e.g., 480 for Spacewar)
+void boulder_network_set_relay_server(const char* address, uint16_t port);
+void boulder_network_enable_fake_ip(); // For easier testing without real Steam
+
 // Server operations
 int boulder_start_server(NetworkSession session, uint16_t port);
+int boulder_start_server_p2p(NetworkSession session, int virtualPort); // P2P mode with virtual port
 void boulder_stop_server(NetworkSession session);
 
 // Client operations
 ConnectionHandle boulder_connect(NetworkSession session, const char* address, uint16_t port);
+ConnectionHandle boulder_connect_p2p(NetworkSession session, SteamID steamID, int virtualPort); // Connect by Steam ID
 void boulder_disconnect(NetworkSession session, ConnectionHandle conn);
 int boulder_connection_state(NetworkSession session, ConnectionHandle conn);
+
+// Identity management
+void boulder_set_local_identity(NetworkSession session, const char* name);
+SteamID boulder_get_local_steam_id(NetworkSession session);
 
 // Messaging
 int boulder_send_message(NetworkSession session, ConnectionHandle conn, const void* data, uint32_t size, int reliable);
