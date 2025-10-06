@@ -14,6 +14,9 @@
 #include "volk.h"
 #include <shaderc/shaderc.hpp>
 
+// Maximum frames that can be processed simultaneously
+constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+
 // Global state for the engine
 static struct {
     bool initialized = false;
@@ -34,9 +37,12 @@ static struct {
     VkExtent2D swapchainExtent;
     VkCommandPool commandPool = nullptr;
     std::vector<VkCommandBuffer> commandBuffers;
-    std::vector<VkSemaphore> imageAvailableSemaphores;
-    std::vector<VkSemaphore> renderFinishedSemaphores;
-    std::vector<VkFence> inFlightFences;
+
+    // Per-frame synchronization (fixed size for frames in flight)
+    VkSemaphore imageAvailableSemaphores[MAX_FRAMES_IN_FLIGHT];
+    VkSemaphore renderFinishedSemaphores[MAX_FRAMES_IN_FLIGHT];
+    VkFence inFlightFences[MAX_FRAMES_IN_FLIGHT];
+
     uint32_t graphicsQueueFamily = UINT32_MAX;
     VkPipelineLayout pipelineLayout = nullptr;
     VkPipeline cubePipeline = nullptr;
@@ -252,20 +258,11 @@ void boulder_shutdown() {
             g_engine.fragShaderModule = nullptr;
         }
 
-        for (auto sem : g_engine.imageAvailableSemaphores) {
-            vkDestroySemaphore(g_engine.device, sem, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(g_engine.device, g_engine.imageAvailableSemaphores[i], nullptr);
+            vkDestroySemaphore(g_engine.device, g_engine.renderFinishedSemaphores[i], nullptr);
+            vkDestroyFence(g_engine.device, g_engine.inFlightFences[i], nullptr);
         }
-        g_engine.imageAvailableSemaphores.clear();
-
-        for (auto sem : g_engine.renderFinishedSemaphores) {
-            vkDestroySemaphore(g_engine.device, sem, nullptr);
-        }
-        g_engine.renderFinishedSemaphores.clear();
-
-        for (auto fence : g_engine.inFlightFences) {
-            vkDestroyFence(g_engine.device, fence, nullptr);
-        }
-        g_engine.inFlightFences.clear();
         if (g_engine.commandPool) {
             vkDestroyCommandPool(g_engine.device, g_engine.commandPool, nullptr);
             g_engine.commandPool = nullptr;
@@ -337,9 +334,7 @@ static int recreate_swapchain() {
     g_engine.resizeEventDuringRecreate = false;
 
     // Wait for in-flight rendering to complete before destroying resources
-    if (!g_engine.inFlightFences.empty()) {
-        vkWaitForFences(g_engine.device, g_engine.inFlightFences.size(), g_engine.inFlightFences.data(), VK_TRUE, UINT64_MAX);
-    }
+    vkWaitForFences(g_engine.device, MAX_FRAMES_IN_FLIGHT, g_engine.inFlightFences, VK_TRUE, UINT64_MAX);
 
     // Clean up old swapchain resources
     for (auto imageView : g_engine.swapchainImageViews) {
@@ -482,206 +477,63 @@ static int recreate_swapchain() {
     return 0;
 }
 
+// Legacy function - use begin_frame/end_frame instead
 int boulder_render() {
-    
-    if (!g_engine.initialized || !g_engine.window || !g_engine.device) {
-        return -1;
-    }
+    uint32_t imageIndex;
+    int result = boulder_begin_frame(&imageIndex);
 
-    // Skip rendering if currently recreating swapchain
-    if (g_engine.isRecreatingSwapchain) {
-        return 0;
-    }
-
-    // Recreate swapchain if needed (loop in case size changed during recreation)
-    int recreateAttempts = 0;
-    while (g_engine.swapchainNeedsRecreate && !g_engine.isRecreatingSwapchain && recreateAttempts < 500) {
+    if (result == -2) {
+        // Swapchain needs recreation
         if (recreate_swapchain() != 0) {
             return -1;
         }
-        recreateAttempts++;
-    }
-
-    // If we exhausted attempts, clear the flag to avoid infinite loop
-    if (recreateAttempts >= 500) {
-        Logger::get().error("Too many swapchain recreation attempts, giving up");
-        g_engine.swapchainNeedsRecreate = false;
-    }
-
-    // Acquire next image
-    uint32_t imageIndex;
-    VkResult result = vkAcquireNextImageKHR(g_engine.device, g_engine.swapchain, UINT64_MAX,
-                                            g_engine.imageAvailableSemaphores[0], VK_NULL_HANDLE, &imageIndex);
-
-    // Wait for this specific frame's fence
-    vkWaitForFences(g_engine.device, 1, &g_engine.inFlightFences[imageIndex], VK_TRUE, UINT64_MAX);
-    vkResetFences(g_engine.device, 1, &g_engine.inFlightFences[imageIndex]);
-
-    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        g_engine.swapchainNeedsRecreate = true;
         return 0;
-    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-        Logger::get().error("Failed to acquire swapchain image");
-        return -1;
+    } else if (result != 0) {
+        return result;
     }
-
-    // Record command buffer
-    VkCommandBuffer cmd = g_engine.commandBuffers[imageIndex];
-    vkResetCommandBuffer(cmd, 0);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
-        Logger::get().error("Failed to begin command buffer");
-        return -1;
-    }
-
-    // Transition image to color attachment optimal
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = g_engine.swapchainImages[imageIndex];
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    // Begin dynamic rendering
-    VkRenderingAttachmentInfo colorAttachment{};
-    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView = g_engine.swapchainImageViews[imageIndex];
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = {{0.1f, 0.2f, 0.3f, 1.0f}}; // Clear color: dark blue
-
-    VkRenderingInfo renderingInfo{};
-    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderingInfo.renderArea.offset = {0, 0};
-    renderingInfo.renderArea.extent = g_engine.swapchainExtent;
-    renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &colorAttachment;
-
-    vkCmdBeginRendering(cmd, &renderingInfo);
 
     // Draw cube with mesh shader
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_engine.cubePipeline);
+    if (g_engine.cubePipeline) {
+        vkCmdBindPipeline(g_engine.activeCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_engine.cubePipeline);
 
-    // Set dynamic viewport and scissor
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = (float)g_engine.swapchainExtent.width;
-    viewport.height = (float)g_engine.swapchainExtent.height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
+        // Set dynamic viewport and scissor
+        boulder_set_viewport(0.0f, 0.0f, (float)g_engine.swapchainExtent.width, (float)g_engine.swapchainExtent.height, 0.0f, 1.0f);
+        boulder_set_scissor(0, 0, g_engine.swapchainExtent.width, g_engine.swapchainExtent.height);
 
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = g_engine.swapchainExtent;
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+        // Set up view-projection matrix (simple perspective)
+        float aspect = (float)g_engine.swapchainExtent.width / (float)g_engine.swapchainExtent.height;
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
+        proj[1][1] *= -1; // Flip Y for Vulkan
 
-    // Set up view-projection matrix (simple perspective)
-    float aspect = (float)g_engine.swapchainExtent.width / (float)g_engine.swapchainExtent.height;
-    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
-    proj[1][1] *= -1; // Flip Y for Vulkan
+        glm::mat4 view = glm::lookAt(
+            glm::vec3(2.0f, 2.0f, 2.0f),
+            glm::vec3(0.0f, 0.0f, 0.0f),
+            glm::vec3(0.0f, 1.0f, 0.0f)
+        );
 
-    glm::mat4 view = glm::lookAt(
-        glm::vec3(2.0f, 2.0f, 2.0f),
-        glm::vec3(0.0f, 0.0f, 0.0f),
-        glm::vec3(0.0f, 1.0f, 0.0f)
-    );
+        glm::mat4 viewProj = proj * view;
 
-    glm::mat4 viewProj = proj * view;
+        // Get current time for animation
+        static auto startTime = std::chrono::high_resolution_clock::now();
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
-    // Get current time for animation
-    static auto startTime = std::chrono::high_resolution_clock::now();
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+        // Push constants
+        struct PushConstants {
+            glm::mat4 viewProj;
+            float time;
+        } pushConstants;
+        pushConstants.viewProj = viewProj;
+        pushConstants.time = time;
 
-    // Push constants
-    struct PushConstants {
-        glm::mat4 viewProj;
-        float time;
-    } pushConstants;
-    pushConstants.viewProj = viewProj;
-    pushConstants.time = time;
+        vkCmdPushConstants(g_engine.activeCommandBuffer, g_engine.pipelineLayout, VK_SHADER_STAGE_MESH_BIT_EXT,
+                           0, sizeof(PushConstants), &pushConstants);
 
-    vkCmdPushConstants(cmd, g_engine.pipelineLayout, VK_SHADER_STAGE_MESH_BIT_EXT,
-                       0, sizeof(PushConstants), &pushConstants);
-
-    // Draw mesh shader (1 workgroup = 1 cube)
-    vkCmdDrawMeshTasksEXT(cmd, 1, 1, 1);
-
-    vkCmdEndRendering(cmd);
-
-    // Transition to present
-    barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.dstAccessMask = 0;
-
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
-        Logger::get().error("Failed to end command buffer");
-        return -1;
+        // Draw mesh shader (1 workgroup = 1 cube)
+        vkCmdDrawMeshTasksEXT(g_engine.activeCommandBuffer, 1, 1, 1);
     }
 
-    // Submit command buffer (use semaphores for this specific image)
-    VkSemaphore waitSemaphores[] = {g_engine.imageAvailableSemaphores[0]};
-    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSemaphore signalSemaphores[] = {g_engine.renderFinishedSemaphores[imageIndex]};
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount = 1;
-    submitInfo.pWaitSemaphores = waitSemaphores;
-    submitInfo.pWaitDstStageMask = waitStages;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = signalSemaphores;
-
-    if (vkQueueSubmit(g_engine.graphicsQueue, 1, &submitInfo, g_engine.inFlightFences[imageIndex]) != VK_SUCCESS) {
-        Logger::get().error("Failed to submit command buffer");
-        return -1;
-    }
-
-    // Present
-    VkSwapchainKHR swapchains[] = {g_engine.swapchain};
-    VkPresentInfoKHR presentInfo{};
-    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = signalSemaphores;
-    presentInfo.swapchainCount = 1;
-    presentInfo.pSwapchains = swapchains;
-    presentInfo.pImageIndices = &imageIndex;
-
-    result = vkQueuePresentKHR(g_engine.graphicsQueue, &presentInfo);
-
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-        g_engine.swapchainNeedsRecreate = true;
-    } else if (result != VK_SUCCESS) {
-        Logger::get().error("Failed to present swapchain image");
-        return -1;
-    }
-
-    return 0;
+    return boulder_end_frame(imageIndex);
 }
 
 int boulder_create_window(int width, int height, const char* title) {
@@ -905,24 +757,20 @@ int boulder_create_window(int width, int height, const char* title) {
         return -1;
     }
 
-    // Create command buffers
-    g_engine.commandBuffers.resize(imageCount);
+    // Create command buffers (one per frame in flight)
+    g_engine.commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = g_engine.commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = imageCount;
+    allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
 
     if (vkAllocateCommandBuffers(g_engine.device, &allocInfo, g_engine.commandBuffers.data()) != VK_SUCCESS) {
         Logger::get().error("Failed to allocate command buffers");
         return -1;
     }
 
-    // Create sync objects (one set per swapchain image)
-    g_engine.imageAvailableSemaphores.resize(imageCount);
-    g_engine.renderFinishedSemaphores.resize(imageCount);
-    g_engine.inFlightFences.resize(imageCount);
-
+    // Create sync objects (one set per frame in flight, NOT per swapchain image)
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -930,7 +778,7 @@ int boulder_create_window(int width, int height, const char* title) {
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    for (size_t i = 0; i < imageCount; i++) {
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.imageAvailableSemaphores[i]) != VK_SUCCESS ||
             vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(g_engine.device, &fenceInfo, nullptr, &g_engine.inFlightFences[i]) != VK_SUCCESS) {
@@ -1701,7 +1549,7 @@ int boulder_end_frame(uint32_t imageIndex) {
     }
 
     g_engine.activeCommandBuffer = nullptr;
-    g_engine.currentFrameIndex = (g_engine.currentFrameIndex + 1) % g_engine.swapchainImages.size();
+    g_engine.currentFrameIndex = (g_engine.currentFrameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
 
     return 0;
 }

@@ -23,34 +23,39 @@ func main() {
 	}
 	defer engine.Shutdown()
 
+	// Create modular subsystems
+	window := boulder.NewWindow(engine)
+	world := boulder.NewWorld(engine)
+	input := boulder.NewInput(engine)
+
 	// Create a window
-	if err := engine.CreateWindow(1280, 720, engine.GetAppName()); err != nil {
+	if err := window.Create(1280, 720, engine.GetAppName()); err != nil {
 		log.Fatalf("Failed to create window: %v", err)
 	}
 
 	boulder.LogInfo("Window created successfully")
 
-	// Create some entities
-	player, err := engine.CreateEntity()
+	// Create player entity
+	player, err := world.NewEntity()
 	if err != nil {
 		log.Fatalf("Failed to create player entity: %v", err)
 	}
 
 	// Add transform component to player
-	if err := engine.AddTransform(player, boulder.Vector3{X: 0, Y: 0, Z: 0}); err != nil {
+	if err := player.AddTransform(boulder.Vector3{X: 0, Y: 0, Z: 0}); err != nil {
 		log.Fatalf("Failed to add transform to player: %v", err)
 	}
 
 	// Add physics body to player
-	if err := engine.AddPhysicsBody(player, 10.0); err != nil {
+	if err := player.AddPhysicsBody(10.0); err != nil {
 		log.Fatalf("Failed to add physics body to player: %v", err)
 	}
 
-	boulder.LogInfo(fmt.Sprintf("Created player entity with ID: %d", player))
+	boulder.LogInfo(fmt.Sprintf("Created player entity with ID: %d", player.ID))
 
 	// Create some additional entities
 	for i := 0; i < 5; i++ {
-		entity, err := engine.CreateEntity()
+		entity, err := world.NewEntity()
 		if err != nil {
 			boulder.LogError(fmt.Sprintf("Failed to create entity %d: %v", i, err))
 			continue
@@ -63,12 +68,12 @@ func main() {
 			Z: 5,
 		}
 
-		if err := engine.AddTransform(entity, position); err != nil {
+		if err := entity.AddTransform(position); err != nil {
 			boulder.LogError(fmt.Sprintf("Failed to add transform to entity %d: %v", i, err))
 			continue
 		}
 
-		if err := engine.AddPhysicsBody(entity, 1.0); err != nil {
+		if err := entity.AddPhysicsBody(1.0); err != nil {
 			boulder.LogError(fmt.Sprintf("Failed to add physics to entity %d: %v", i, err))
 			continue
 		}
@@ -79,7 +84,7 @@ func main() {
 			Y: float32(i),
 			Z: 0,
 		}
-		engine.SetVelocity(entity, velocity)
+		entity.SetVelocity(velocity)
 	}
 
 	// Main game loop
@@ -89,40 +94,40 @@ func main() {
 
 	boulder.LogInfo("Starting main loop")
 
-	for !engine.ShouldClose() {
+	for !window.ShouldClose() {
 		// Calculate delta time
 		currentTime := time.Now()
 		deltaTime := float32(currentTime.Sub(lastTime).Seconds())
 		lastTime = currentTime
 
 		// Poll for events
-		engine.PollEvents()
+		window.PollEvents()
 
 		// Simple input handling
-		if engine.IsKeyPressed(79) { // Right arrow (SDL scancode)
-			pos, _ := engine.GetTransform(player)
+		if input.IsKeyPressed(boulder.KeyRight) {
+			pos, _ := player.GetTransform()
 			pos.X += 5.0 * deltaTime
-			engine.SetTransform(player, pos)
+			player.SetTransform(pos)
 		}
-		if engine.IsKeyPressed(80) { // Left arrow
-			pos, _ := engine.GetTransform(player)
+		if input.IsKeyPressed(boulder.KeyLeft) {
+			pos, _ := player.GetTransform()
 			pos.X -= 5.0 * deltaTime
-			engine.SetTransform(player, pos)
+			player.SetTransform(pos)
 		}
-		if engine.IsKeyPressed(82) { // Up arrow
-			pos, _ := engine.GetTransform(player)
+		if input.IsKeyPressed(boulder.KeyUp) {
+			pos, _ := player.GetTransform()
 			pos.Z -= 5.0 * deltaTime
-			engine.SetTransform(player, pos)
+			player.SetTransform(pos)
 		}
-		if engine.IsKeyPressed(81) { // Down arrow
-			pos, _ := engine.GetTransform(player)
+		if input.IsKeyPressed(boulder.KeyDown) {
+			pos, _ := player.GetTransform()
 			pos.Z += 5.0 * deltaTime
-			engine.SetTransform(player, pos)
+			player.SetTransform(pos)
 		}
 
 		// Jump on spacebar
-		if engine.IsKeyPressed(44) { // Space (SDL scancode)
-			engine.SetVelocity(player, boulder.Vector3{X: 0, Y: 10, Z: 0})
+		if input.IsKeyPressed(boulder.KeySpace) {
+			player.SetVelocity(boulder.Vector3{X: 0, Y: 10, Z: 0})
 		}
 
 		// Update physics and render

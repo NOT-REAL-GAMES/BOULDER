@@ -7,7 +7,7 @@ package boulder
 import "C"
 import (
 	"errors"
-	"io/ioutil"
+	"os"
 	"unsafe"
 )
 
@@ -16,20 +16,20 @@ type ShaderKind int
 
 const (
 	// Shader kinds from shaderc
-	ShaderKindVertex                 ShaderKind = 0
-	ShaderKindFragment               ShaderKind = 1
-	ShaderKindCompute                ShaderKind = 2
-	ShaderKindGeometry               ShaderKind = 3
-	ShaderKindTessControl            ShaderKind = 4
-	ShaderKindTessEvaluation         ShaderKind = 5
-	ShaderKindMesh                   ShaderKind = 0x0000000B // shaderc_glsl_default_mesh_shader
-	ShaderKindTask                   ShaderKind = 0x0000000C // shaderc_glsl_default_task_shader
-	ShaderKindRayGen                 ShaderKind = 8
-	ShaderKindAnyHit                 ShaderKind = 9
-	ShaderKindClosestHit             ShaderKind = 10
-	ShaderKindMiss                   ShaderKind = 11
-	ShaderKindIntersection           ShaderKind = 12
-	ShaderKindCallable               ShaderKind = 13
+	ShaderKindVertex         ShaderKind = 0
+	ShaderKindFragment       ShaderKind = 1
+	ShaderKindCompute        ShaderKind = 2
+	ShaderKindGeometry       ShaderKind = 3
+	ShaderKindTessControl    ShaderKind = 4
+	ShaderKindTessEvaluation ShaderKind = 5
+	ShaderKindMesh           ShaderKind = 0x0000000B // shaderc_glsl_default_mesh_shader
+	ShaderKindTask           ShaderKind = 0x0000000C // shaderc_glsl_default_task_shader
+	ShaderKindRayGen         ShaderKind = 8
+	ShaderKindAnyHit         ShaderKind = 9
+	ShaderKindClosestHit     ShaderKind = 10
+	ShaderKindMiss           ShaderKind = 11
+	ShaderKindIntersection   ShaderKind = 12
+	ShaderKindCallable       ShaderKind = 13
 )
 
 // ShaderModuleID uniquely identifies a compiled shader module
@@ -75,7 +75,7 @@ func (e *Engine) CompileShaderFromFile(path string, kind ShaderKind) (*Shader, e
 	}
 
 	// Read file
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +122,7 @@ func (s *Shader) ReloadFromFile(path string) error {
 	}
 
 	// Read file
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}

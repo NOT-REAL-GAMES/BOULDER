@@ -40,7 +40,7 @@ package main
 
 import (
     "log"
-    boulder "github.com/boulder/go-bindings"
+	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
 func main() {
