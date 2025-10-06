@@ -19,10 +19,7 @@ func vkMakeVersion(major, minor, patch uint32) uint32 {
 func testP2PWithSpacewar(engine *boulder.Engine) {
 	boulder.LogInfo("\n=== P2P with Spacewar AppID ===")
 	boulder.LogInfo("NOTE: This requires Steam to be running!")
-	boulder.LogInfo("Using Spacewar (AppID 480) - Steam's official test app\n")
-
-	// Initialize with Spacewar AppID
-	boulder.InitWithSteamApp(480)
+	boulder.LogInfo("Testing P2P connection (AppID 480 already initialized)\n")
 
 	// Create server session
 	server, err := boulder.NewNetworkSession(engine)
@@ -41,7 +38,15 @@ func testP2PWithSpacewar(engine *boulder.Engine) {
 
 	serverSteamID := server.GetLocalSteamID()
 	if serverSteamID == 0 {
-		boulder.LogError("No Steam ID - is Steam running?")
+		boulder.LogError("❌ No Steam ID obtained")
+		boulder.LogInfo("\nP2P requires full Steamworks SDK integration:")
+		boulder.LogInfo("  • Currently using GameNetworkingSockets in standalone mode")
+		boulder.LogInfo("  • For real P2P, integrate Steamworks SDK (SteamAPI_Init)")
+		boulder.LogInfo("  • Alternative: Use IP-based networking (works everywhere!)")
+		boulder.LogInfo("\nWorkaround for testing P2P without Steam:")
+		boulder.LogInfo("  1. Use relay servers (configure with SetRelayServer)")
+		boulder.LogInfo("  2. Deploy dedicated relay infrastructure")
+		boulder.LogInfo("  3. Use IP-based mode for LAN/VPN scenarios")
 		return
 	}
 
@@ -136,7 +141,17 @@ func testP2PWithSpacewar(engine *boulder.Engine) {
 }
 
 func p2p_demo() {
-	boulder.LogInfo("=== Networking Modes Demo ===\n")
+	boulder.LogInfo("=== BOULDER Networking Demo ===\n")
+
+	boulder.LogInfo("This demo shows:")
+	boulder.LogInfo("  ✓ IP-based networking (fully working)")
+	boulder.LogInfo("  ✓ P2P API demonstration (requires Steamworks SDK)")
+	boulder.LogInfo("")
+
+	// IMPORTANT: Initialize with Spacewar AppID BEFORE creating any sessions
+	// This enables P2P/Steam features for ALL sessions
+	boulder.LogInfo("Initializing with Spacewar (AppID 480)...")
+	boulder.InitWithSteamApp(480)
 
 	// Initialize engine
 	engine := boulder.NewEngine("Networking Demo", vkMakeVersion(1, 0, 0))
@@ -146,7 +161,7 @@ func p2p_demo() {
 	defer engine.Shutdown()
 
 	// Demonstrate both modes
-	boulder.LogInfo("BOULDER supports two networking modes:\n")
+	boulder.LogInfo("\nBOULDER supports two networking modes:\n")
 
 	boulder.LogInfo("1. IP-BASED NETWORKING (Direct Connection)")
 	boulder.LogInfo("   - Uses real IP addresses and ports")

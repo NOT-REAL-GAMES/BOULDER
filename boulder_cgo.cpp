@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <queue>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <SDL3/SDL.h>
 #include <flecs.h>
 #include <glm/glm.hpp>
@@ -1849,20 +1851,8 @@ NetworkSession boulder_create_network_session() {
             SteamDatagramErrMsg errMsg;
 
             // If Steam AppID is set, use it for initialization (enables P2P/Steam features)
-            SteamNetworkingIdentity identity;
             if (g_steamAppId != 0) {
-                // Set up identity for Steam authentication
-                identity.Clear();
                 Logger::get().info("Initializing GameNetworkingSockets with Steam AppID {}", g_steamAppId);
-
-                // Set environment variable for Steam AppID
-                char appIdStr[32];
-                snprintf(appIdStr, sizeof(appIdStr), "%u", g_steamAppId);
-                #ifdef _WIN32
-                _putenv_s("SteamAppId", appIdStr);
-                #else
-                setenv("SteamAppId", appIdStr, 1);
-                #endif
             }
 
             if (!GameNetworkingSockets_Init(nullptr, errMsg)) {
@@ -1870,6 +1860,13 @@ NetworkSession boulder_create_network_session() {
                 return nullptr;
             }
             g_gnsInitialized = true;
+
+            // If using Steam, wait a moment for authentication
+            if (g_steamAppId != 0) {
+                Logger::get().info("Waiting for Steam authentication...");
+                // Give Steam time to authenticate
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
 
             // Set debug output
             SteamNetworkingUtils()->SetDebugOutputFunction(k_ESteamNetworkingSocketsDebugOutputType_Msg,
@@ -2060,6 +2057,15 @@ void boulder_network_init_with_steam_app(uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_gnsInitMutex);
     if (!g_gnsInitialized) {
         g_steamAppId = appId;
+
+        // Create steam_appid.txt file for Steam to recognize the AppID
+        FILE* f = fopen("steam_appid.txt", "w");
+        if (f) {
+            fprintf(f, "%u\n", appId);
+            fclose(f);
+            Logger::get().info("Created steam_appid.txt with AppID {}", appId);
+        }
+
         Logger::get().info("Steam AppID set to {} (will be used on next session creation)", appId);
     }
 }
@@ -2154,10 +2160,20 @@ SteamID boulder_get_local_steam_id(NetworkSession session) {
     s->interface->GetIdentity(&identity);
 
     if (identity.IsInvalid()) {
+        Logger::get().warning("Steam identity is invalid - Steam may not be running or not authenticated");
+        Logger::get().info("Make sure:");
+        Logger::get().info("  1. Steam is running");
+        Logger::get().info("  2. steam_appid.txt exists with AppID {}", g_steamAppId);
+        Logger::get().info("  3. You're logged into Steam");
         return 0;
     }
 
-    return identity.GetSteamID64();
+    SteamID steamID = identity.GetSteamID64();
+    if (steamID != 0) {
+        Logger::get().info("Authenticated with Steam ID: {}", steamID);
+    }
+
+    return steamID;
 }
 
 int boulder_send_message(NetworkSession session, ConnectionHandle conn, const void* data, uint32_t size, int reliable) {
