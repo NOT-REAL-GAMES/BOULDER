@@ -163,7 +163,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(assimp)
 
+# Add GameNetworkingSockets for networking
+FetchContent_Declare(
+    GameNetworkingSockets
+    GIT_REPOSITORY https://github.com/ValveSoftware/GameNetworkingSockets.git
+    GIT_TAG v1.4.1
+)
 
+set(GAMENETWORKINGSOCKETS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GAMENETWORKINGSOCKETS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(GameNetworkingSockets)
 
 # Set position independent code for all targets when building shared library
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -193,6 +203,7 @@ target_link_libraries(boulder_shared PUBLIC
     volk
     glm::glm
     ZLIB::ZLIB
+    GameNetworkingSockets
 )
 
 target_compile_definitions(boulder_shared PUBLIC
@@ -229,6 +240,7 @@ target_link_libraries(Boulder PRIVATE
     Jolt
     volk
     glm::glm
+    GameNetworkingSockets
 )
 
 target_compile_definitions(Boulder PRIVATE

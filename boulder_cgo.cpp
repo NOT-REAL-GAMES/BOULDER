@@ -4,6 +4,8 @@
 #include <iostream>
 #include <memory>
 #include <unordered_map>
+#include <queue>
+#include <mutex>
 #include <SDL3/SDL.h>
 #include <flecs.h>
 #include <glm/glm.hpp>
@@ -13,6 +15,8 @@
 #include <assimp/postprocess.h>
 #include "volk.h"
 #include <shaderc/shaderc.hpp>
+#include <steam/steamnetworkingsockets.h>
+#include <steam/isteamnetworkingutils.h>
 
 // Maximum frames that can be processed simultaneously
 constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
@@ -1660,6 +1664,418 @@ int boulder_recreate_swapchain() {
 
     g_engine.swapchainNeedsRecreate = true;
     return 0;
+}
+
+// Network implementation
+
+// Forward declaration
+struct BoulderNetworkSession;
+
+// Global GameNetworkingSockets initialization tracking
+static bool g_gnsInitialized = false;
+static int g_gnsRefCount = 0;
+static std::mutex g_gnsInitMutex;
+
+// Global map to track sessions (needed because GNS doesn't support userdata in all callbacks)
+static std::unordered_map<HSteamListenSocket, BoulderNetworkSession*> g_serverSessions;
+static std::unordered_map<HSteamNetConnection, BoulderNetworkSession*> g_connectionSessions;
+static std::mutex g_sessionMapMutex;
+
+struct BoulderNetworkSession {
+    ISteamNetworkingSockets* interface = nullptr;
+    HSteamListenSocket listenSocket = k_HSteamListenSocket_Invalid;
+    HSteamNetPollGroup pollGroup = k_HSteamNetPollGroup_Invalid;
+    std::unordered_map<HSteamNetConnection, ConnectionHandle> connectionMap;
+    std::unordered_map<ConnectionHandle, HSteamNetConnection> reverseMap;
+    ConnectionHandle nextConnectionId = 1;
+    std::queue<NetworkEvent> eventQueue;
+    std::mutex eventMutex;
+    bool isServer = false;
+
+    static void DebugOutput(ESteamNetworkingSocketsDebugOutputType eType, const char* pszMsg) {
+        if (eType == k_ESteamNetworkingSocketsDebugOutputType_Msg ||
+            eType == k_ESteamNetworkingSocketsDebugOutputType_Warning ||
+            eType == k_ESteamNetworkingSocketsDebugOutputType_Error) {
+            Logger::get().info("[GNS] {}", pszMsg);
+        }
+    }
+
+    ConnectionHandle getOrCreateConnectionHandle(HSteamNetConnection conn) {
+        auto it = connectionMap.find(conn);
+        if (it != connectionMap.end()) {
+            return it->second;
+        }
+        ConnectionHandle handle = nextConnectionId++;
+        connectionMap[conn] = handle;
+        reverseMap[handle] = conn;
+        return handle;
+    }
+
+    void removeConnection(HSteamNetConnection conn) {
+        auto it = connectionMap.find(conn);
+        if (it != connectionMap.end()) {
+            reverseMap.erase(it->second);
+            connectionMap.erase(it);
+        }
+    }
+
+    void processCallbacks() {
+        if (!interface) return;
+
+        // Process incoming messages
+        ISteamNetworkingMessage* messages[256];
+        int numMessages = interface->ReceiveMessagesOnPollGroup(pollGroup, messages, 256);
+
+        for (int i = 0; i < numMessages; i++) {
+            auto msg = messages[i];
+            ConnectionHandle handle = getOrCreateConnectionHandle(msg->m_conn);
+
+            NetworkEvent event;
+            event.type = 3; // Message
+            event.connection = handle;
+            event.dataSize = msg->m_cbSize;
+            event.data = new uint8_t[msg->m_cbSize];
+            memcpy(event.data, msg->m_pData, msg->m_cbSize);
+
+            std::lock_guard<std::mutex> lock(eventMutex);
+            eventQueue.push(event);
+
+            msg->Release();
+        }
+    }
+
+    static void OnConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* pInfo, BoulderNetworkSession* session) {
+        if (!session) return;
+
+        switch (pInfo->m_info.m_eState) {
+            case k_ESteamNetworkingConnectionState_Connected: {
+                ConnectionHandle handle = session->getOrCreateConnectionHandle(pInfo->m_hConn);
+                if (session->pollGroup != k_HSteamNetPollGroup_Invalid) {
+                    session->interface->SetConnectionPollGroup(pInfo->m_hConn, session->pollGroup);
+                }
+
+                NetworkEvent event;
+                event.type = 1; // Connected
+                event.connection = handle;
+                event.data = nullptr;
+                event.dataSize = 0;
+
+                std::lock_guard<std::mutex> lock(session->eventMutex);
+                session->eventQueue.push(event);
+
+                Logger::get().info("Connection established: {}", handle);
+                break;
+            }
+
+            case k_ESteamNetworkingConnectionState_ClosedByPeer:
+            case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: {
+                auto it = session->connectionMap.find(pInfo->m_hConn);
+                if (it != session->connectionMap.end()) {
+                    ConnectionHandle handle = it->second;
+
+                    NetworkEvent event;
+                    event.type = 2; // Disconnected
+                    event.connection = handle;
+                    event.data = nullptr;
+                    event.dataSize = 0;
+
+                    std::lock_guard<std::mutex> lock(session->eventMutex);
+                    session->eventQueue.push(event);
+
+                    Logger::get().info("Connection closed: {}", handle);
+                    session->removeConnection(pInfo->m_hConn);
+                }
+
+                session->interface->CloseConnection(pInfo->m_hConn, 0, nullptr, false);
+                break;
+            }
+
+            case k_ESteamNetworkingConnectionState_Connecting: {
+                if (session->isServer) {
+                    // Register incoming connection in global map
+                    {
+                        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+                        g_connectionSessions[pInfo->m_hConn] = session;
+                    }
+
+                    if (session->interface->AcceptConnection(pInfo->m_hConn) != k_EResultOK) {
+                        session->interface->CloseConnection(pInfo->m_hConn, 0, nullptr, false);
+                        Logger::get().error("Failed to accept incoming connection");
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+};
+
+static void GlobalConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* pInfo) {
+    BoulderNetworkSession* session = nullptr;
+
+    // Find session with mutex locked, then unlock before calling OnConnectionStatusChanged
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+
+        // Try to find session from connection map first
+        auto connIt = g_connectionSessions.find(pInfo->m_hConn);
+        if (connIt != g_connectionSessions.end()) {
+            session = connIt->second;
+        }
+
+        // If not found, try to find from server listen socket (for incoming connections)
+        if (!session && pInfo->m_info.m_hListenSocket != k_HSteamListenSocket_Invalid) {
+            auto serverIt = g_serverSessions.find(pInfo->m_info.m_hListenSocket);
+            if (serverIt != g_serverSessions.end()) {
+                session = serverIt->second;
+            }
+        }
+    } // Mutex unlocked here!
+
+    // Call OnConnectionStatusChanged without holding the mutex to avoid deadlock
+    if (session) {
+        BoulderNetworkSession::OnConnectionStatusChanged(pInfo, session);
+    }
+}
+
+NetworkSession boulder_create_network_session() {
+    // Initialize GNS globally with reference counting
+    {
+        std::lock_guard<std::mutex> lock(g_gnsInitMutex);
+        if (!g_gnsInitialized) {
+            SteamDatagramErrMsg errMsg;
+            if (!GameNetworkingSockets_Init(nullptr, errMsg)) {
+                Logger::get().error("Failed to initialize GameNetworkingSockets: {}", errMsg);
+                return nullptr;
+            }
+            g_gnsInitialized = true;
+
+            // Set debug output
+            SteamNetworkingUtils()->SetDebugOutputFunction(k_ESteamNetworkingSocketsDebugOutputType_Msg,
+                                                            BoulderNetworkSession::DebugOutput);
+
+            // Set global connection status changed callback
+            SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged(GlobalConnectionStatusChanged);
+        }
+        g_gnsRefCount++;
+    }
+
+    BoulderNetworkSession* session = new BoulderNetworkSession();
+    session->interface = SteamNetworkingSockets();
+
+    if (!session->interface) {
+        Logger::get().error("Failed to get SteamNetworkingSockets interface");
+        std::lock_guard<std::mutex> lock(g_gnsInitMutex);
+        g_gnsRefCount--;
+        delete session;
+        return nullptr;
+    }
+
+    session->pollGroup = session->interface->CreatePollGroup();
+    if (session->pollGroup == k_HSteamNetPollGroup_Invalid) {
+        Logger::get().error("Failed to create poll group");
+        std::lock_guard<std::mutex> lock(g_gnsInitMutex);
+        g_gnsRefCount--;
+        delete session;
+        return nullptr;
+    }
+
+    Logger::get().info("Network session created");
+    return session;
+}
+
+void boulder_destroy_network_session(NetworkSession session) {
+    if (!session) return;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    if (s->listenSocket != k_HSteamListenSocket_Invalid) {
+        s->interface->CloseListenSocket(s->listenSocket);
+    }
+
+    if (s->pollGroup != k_HSteamNetPollGroup_Invalid) {
+        s->interface->DestroyPollGroup(s->pollGroup);
+    }
+
+    // Close all connections
+    for (const auto& [conn, handle] : s->connectionMap) {
+        s->interface->CloseConnection(conn, 0, "Session destroyed", false);
+    }
+
+    delete s;
+
+    // Decrement reference count and kill GNS if no more sessions
+    {
+        std::lock_guard<std::mutex> lock(g_gnsInitMutex);
+        g_gnsRefCount--;
+        if (g_gnsRefCount == 0 && g_gnsInitialized) {
+            GameNetworkingSockets_Kill();
+            g_gnsInitialized = false;
+        }
+    }
+
+    Logger::get().info("Network session destroyed");
+}
+
+void boulder_network_update(NetworkSession session) {
+    if (!session) return;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+    s->interface->RunCallbacks();
+    s->processCallbacks();
+}
+
+int boulder_start_server(NetworkSession session, uint16_t port) {
+    if (!session) return -1;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    SteamNetworkingIPAddr addr;
+    addr.Clear();
+    addr.m_port = port;
+
+    s->listenSocket = s->interface->CreateListenSocketIP(addr, 0, nullptr);
+    if (s->listenSocket == k_HSteamListenSocket_Invalid) {
+        Logger::get().error("Failed to create listen socket on port {}", port);
+        return -1;
+    }
+
+    // Register server in global map
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+        g_serverSessions[s->listenSocket] = s;
+    }
+
+    s->isServer = true;
+    Logger::get().info("Server started on port {}", port);
+    return 0;
+}
+
+void boulder_stop_server(NetworkSession session) {
+    if (!session) return;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    if (s->listenSocket != k_HSteamListenSocket_Invalid) {
+        // Remove from global map
+        {
+            std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+            g_serverSessions.erase(s->listenSocket);
+        }
+
+        s->interface->CloseListenSocket(s->listenSocket);
+        s->listenSocket = k_HSteamListenSocket_Invalid;
+        s->isServer = false;
+        Logger::get().info("Server stopped");
+    }
+}
+
+ConnectionHandle boulder_connect(NetworkSession session, const char* address, uint16_t port) {
+    if (!session || !address) return 0;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    SteamNetworkingIPAddr addr;
+    if (!addr.ParseString(address)) {
+        Logger::get().error("Failed to parse address: {}", address);
+        return 0;
+    }
+    addr.m_port = port;
+
+    HSteamNetConnection conn = s->interface->ConnectByIPAddress(addr, 0, nullptr);
+    if (conn == k_HSteamNetConnection_Invalid) {
+        Logger::get().error("Failed to connect to {}:{}", address, port);
+        return 0;
+    }
+
+    // Register connection in global map
+    {
+        std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+        g_connectionSessions[conn] = s;
+    }
+
+    ConnectionHandle handle = s->getOrCreateConnectionHandle(conn);
+    Logger::get().info("Connecting to {}:{} (handle: {})", address, port, handle);
+    return handle;
+}
+
+void boulder_disconnect(NetworkSession session, ConnectionHandle conn) {
+    if (!session) return;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+    auto it = s->reverseMap.find(conn);
+    if (it != s->reverseMap.end()) {
+        // Remove from global map
+        {
+            std::lock_guard<std::mutex> lock(g_sessionMapMutex);
+            g_connectionSessions.erase(it->second);
+        }
+
+        s->interface->CloseConnection(it->second, 0, "Disconnected by user", false);
+        s->removeConnection(it->second);
+        Logger::get().info("Disconnected connection {}", conn);
+    }
+}
+
+int boulder_connection_state(NetworkSession session, ConnectionHandle conn) {
+    if (!session) return -1;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+    auto it = s->reverseMap.find(conn);
+    if (it == s->reverseMap.end()) {
+        return -1; // Invalid connection
+    }
+
+    SteamNetConnectionInfo_t info;
+    if (s->interface->GetConnectionInfo(it->second, &info)) {
+        return static_cast<int>(info.m_eState);
+    }
+
+    return -1;
+}
+
+int boulder_send_message(NetworkSession session, ConnectionHandle conn, const void* data, uint32_t size, int reliable) {
+    if (!session || !data || size == 0) return -1;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+    auto it = s->reverseMap.find(conn);
+    if (it == s->reverseMap.end()) {
+        return -1; // Invalid connection
+    }
+
+    int flags = reliable ? k_nSteamNetworkingSend_Reliable : k_nSteamNetworkingSend_Unreliable;
+    EResult result = s->interface->SendMessageToConnection(it->second, data, size, flags, nullptr);
+
+    if (result != k_EResultOK) {
+        Logger::get().error("Failed to send message: {}", (int)result);
+        return -1;
+    }
+
+    return 0;
+}
+
+int boulder_poll_network_event(NetworkSession session, NetworkEvent* event) {
+    if (!session || !event) return 0;
+
+    BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
+
+    std::lock_guard<std::mutex> lock(s->eventMutex);
+    if (s->eventQueue.empty()) {
+        event->type = 0; // No event
+        return 0;
+    }
+
+    *event = s->eventQueue.front();
+    s->eventQueue.pop();
+    return 1;
+}
+
+void boulder_free_network_event_data(void* data) {
+    if (data) {
+        delete[] static_cast<uint8_t*>(data);
+    }
 }
 
 } // extern "C"

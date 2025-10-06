@@ -76,6 +76,38 @@ void boulder_set_push_constants(const void* data, uint32_t size, uint32_t offset
 void boulder_get_swapchain_extent(int* width, int* height);
 int boulder_recreate_swapchain();
 
+// Network management
+typedef void* NetworkSession;
+typedef uint64_t ConnectionHandle;
+
+// Session lifecycle
+NetworkSession boulder_create_network_session();
+void boulder_destroy_network_session(NetworkSession session);
+void boulder_network_update(NetworkSession session);
+
+// Server operations
+int boulder_start_server(NetworkSession session, uint16_t port);
+void boulder_stop_server(NetworkSession session);
+
+// Client operations
+ConnectionHandle boulder_connect(NetworkSession session, const char* address, uint16_t port);
+void boulder_disconnect(NetworkSession session, ConnectionHandle conn);
+int boulder_connection_state(NetworkSession session, ConnectionHandle conn);
+
+// Messaging
+int boulder_send_message(NetworkSession session, ConnectionHandle conn, const void* data, uint32_t size, int reliable);
+
+// Event polling
+typedef struct {
+    int type; // 0=none, 1=connected, 2=disconnected, 3=message
+    ConnectionHandle connection;
+    uint8_t* data;
+    uint32_t dataSize;
+} NetworkEvent;
+
+int boulder_poll_network_event(NetworkSession session, NetworkEvent* event);
+void boulder_free_network_event_data(void* data);
+
 #ifdef __cplusplus
 }
 #endif
