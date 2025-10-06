@@ -9,10 +9,6 @@ import (
 	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
-func vkMakeVersion(major, minor, patch uint32) uint32 {
-	return uint32(major<<22 | minor<<12 | patch)
-}
-
 // Game messages
 type MessageType uint8
 
@@ -188,7 +184,7 @@ func (gc *GameClient) Shutdown() {
 	gc.session.Destroy()
 }
 
-func main() {
+func mp_demo() {
 	boulder.LogInfo("=== Multiplayer Game Demo ===")
 
 	// Initialize engine
@@ -245,8 +241,8 @@ func main() {
 
 	// Simulate gameplay
 	moves := []struct {
-		client *GameClient
-		name   string
+		client  *GameClient
+		name    string
 		x, y, z float32
 	}{
 		{client1, "Player 1", 10, 0, 5},

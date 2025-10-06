@@ -8,11 +8,7 @@ import (
 	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
-func vkMakeVersion(major, minor, patch uint32) uint32 {
-	return uint32(major<<22 | minor<<12 | patch)
-}
-
-func main() {
+func network_simple() {
 	boulder.LogInfo("Starting simple network test")
 
 	// Create engine

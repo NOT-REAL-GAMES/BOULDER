@@ -8,10 +8,6 @@ import (
 	boulder "github.com/NOT-REAL-GAMES/BOULDER/go-bindings"
 )
 
-func vkMakeVersion(major, minor, patch uint32) uint32 {
-	return uint32(major<<22 | minor<<12 | patch)
-}
-
 func runServer(engine *boulder.Engine) {
 	// Create network session
 	session, err := boulder.NewNetworkSession(engine)
@@ -144,7 +140,7 @@ func runClient(engine *boulder.Engine) {
 	boulder.LogInfo("Client done")
 }
 
-func main() {
+func network_demo() {
 	boulder.LogInfo("Starting network test")
 
 	// Create engine
