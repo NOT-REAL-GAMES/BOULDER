@@ -234,9 +234,85 @@ See `go-bindings/examples/`:
 - Don't hold locks while calling network functions
 - The implementation handles internal synchronization
 
+## P2P Networking (Steam Datagram Relay)
+
+BOULDER includes P2P networking APIs that use Steam IDs instead of IP addresses, eliminating the need for port forwarding.
+
+### Current Status
+
+✅ **API Implementation** - Complete
+✅ **Virtual Ports** - Working
+📋 **Steam Authentication** - Requires Steamworks SDK integration
+
+### P2P API
+
+```go
+// Initialize with Steam AppID (call BEFORE creating any sessions!)
+boulder.InitWithSteamApp(480)  // Spacewar for testing
+
+// Create P2P server
+session.StartServerP2P(virtualPort)
+
+// Connect via Steam ID
+conn, _ := session.ConnectP2P(serverSteamID, virtualPort)
+
+// Get your Steam ID
+myID := session.GetLocalSteamID()
+```
+
+### Requirements for Full P2P
+
+To enable Steam-authenticated P2P connections:
+
+1. **Integrate Steamworks SDK**
+   ```cpp
+   #include <steam/steam_api.h>
+   ```
+
+2. **Initialize Steam API**
+   ```cpp
+   // Call before GameNetworkingSockets_Init
+   if (!SteamAPI_Init()) {
+       // Handle error
+   }
+   ```
+
+3. **Set Steam AppID**
+   - Use your own Steam AppID from Steamworks Partner site
+   - Or use Spacewar (480) for testing
+   - Create `steam_appid.txt` with your AppID
+
+### Testing Without Full Steam Integration
+
+Until Steamworks SDK is integrated, use these alternatives:
+
+1. **IP-Based Networking** (Recommended)
+   - Works everywhere without Steam
+   - Perfect for LAN and development
+   - Use VPN for internet play
+
+2. **Custom Relay Servers**
+   ```go
+   boulder.SetRelayServer("relay.yourdomain.com", 27020)
+   ```
+
+3. **FakeIP Mode** (Local testing only)
+   ```go
+   boulder.EnableFakeIP()
+   ```
+
+### P2P Benefits (when authenticated)
+
+- ✅ No port forwarding required
+- ✅ Works through most NATs
+- ✅ Steam Datagram Relay for global connectivity
+- ✅ Automatic best-route selection
+- ✅ Fallback to relay when direct fails
+
 ## Future Enhancements
 
-- [ ] NAT punchthrough / relay servers
+- [ ] Full Steamworks SDK integration
+- [ ] Custom relay server infrastructure
 - [ ] Bandwidth monitoring and throttling
 - [ ] Connection quality metrics (ping, packet loss)
 - [ ] Encryption support
