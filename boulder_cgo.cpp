@@ -40,8 +40,10 @@ static struct {
 
     // Per-frame synchronization (fixed size for frames in flight)
     VkSemaphore imageAvailableSemaphores[MAX_FRAMES_IN_FLIGHT];
-    VkSemaphore renderFinishedSemaphores[MAX_FRAMES_IN_FLIGHT];
     VkFence inFlightFences[MAX_FRAMES_IN_FLIGHT];
+
+    // Per-swapchain-image semaphores (must be separate per image for present)
+    std::vector<VkSemaphore> renderFinishedSemaphores;
 
     uint32_t graphicsQueueFamily = UINT32_MAX;
     VkPipelineLayout pipelineLayout = nullptr;
@@ -260,9 +262,13 @@ void boulder_shutdown() {
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(g_engine.device, g_engine.imageAvailableSemaphores[i], nullptr);
-            vkDestroySemaphore(g_engine.device, g_engine.renderFinishedSemaphores[i], nullptr);
             vkDestroyFence(g_engine.device, g_engine.inFlightFences[i], nullptr);
         }
+
+        for (auto sem : g_engine.renderFinishedSemaphores) {
+            vkDestroySemaphore(g_engine.device, sem, nullptr);
+        }
+        g_engine.renderFinishedSemaphores.clear();
         if (g_engine.commandPool) {
             vkDestroyCommandPool(g_engine.device, g_engine.commandPool, nullptr);
             g_engine.commandPool = nullptr;
@@ -341,6 +347,12 @@ static int recreate_swapchain() {
         vkDestroyImageView(g_engine.device, imageView, nullptr);
     }
     g_engine.swapchainImageViews.clear();
+
+    // Clean up old per-image semaphores
+    for (auto sem : g_engine.renderFinishedSemaphores) {
+        vkDestroySemaphore(g_engine.device, sem, nullptr);
+    }
+    g_engine.renderFinishedSemaphores.clear();
 
     VkSwapchainKHR oldSwapchain = g_engine.swapchain;
 
@@ -434,27 +446,20 @@ static int recreate_swapchain() {
         }
     }
 
-    // Recreate command buffers if count changed
-    if (g_engine.commandBuffers.size() != imageCount) {
-        if (!g_engine.commandBuffers.empty()) {
-            vkFreeCommandBuffers(g_engine.device, g_engine.commandPool,
-                               static_cast<uint32_t>(g_engine.commandBuffers.size()),
-                               g_engine.commandBuffers.data());
-        }
+    // Recreate per-image semaphores
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
-        g_engine.commandBuffers.resize(imageCount);
-        VkCommandBufferAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = g_engine.commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = imageCount;
-
-        if (vkAllocateCommandBuffers(g_engine.device, &allocInfo, g_engine.commandBuffers.data()) != VK_SUCCESS) {
-            Logger::get().error("Failed to reallocate command buffers");
+    g_engine.renderFinishedSemaphores.resize(imageCount);
+    for (size_t i = 0; i < imageCount; i++) {
+        if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            Logger::get().error("Failed to recreate render finished semaphore for image {}", i);
             g_engine.isRecreatingSwapchain = false;
             return -1;
         }
     }
+
+    // Command buffers are per-frame-in-flight (MAX_FRAMES_IN_FLIGHT), not per-image, so no recreation needed
 
     Logger::get().info("Swapchain recreated successfully!");
 
@@ -770,7 +775,7 @@ int boulder_create_window(int width, int height, const char* title) {
         return -1;
     }
 
-    // Create sync objects (one set per frame in flight, NOT per swapchain image)
+    // Create sync objects
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -778,11 +783,20 @@ int boulder_create_window(int width, int height, const char* title) {
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
+    // Per-frame-in-flight sync (imageAvailable and fences)
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(g_engine.device, &fenceInfo, nullptr, &g_engine.inFlightFences[i]) != VK_SUCCESS) {
             Logger::get().error("Failed to create sync objects for frame {}", i);
+            return -1;
+        }
+    }
+
+    // Per-swapchain-image semaphores (renderFinished - used by present)
+    g_engine.renderFinishedSemaphores.resize(imageCount);
+    for (size_t i = 0; i < imageCount; i++) {
+        if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            Logger::get().error("Failed to create render finished semaphore for image {}", i);
             return -1;
         }
     }
@@ -1520,7 +1534,8 @@ int boulder_end_frame(uint32_t imageIndex) {
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    VkSemaphore signalSemaphores[] = {g_engine.renderFinishedSemaphores[g_engine.currentFrameIndex]};
+    // Use imageIndex for renderFinished (per-swapchain-image, not per-frame)
+    VkSemaphore signalSemaphores[] = {g_engine.renderFinishedSemaphores[imageIndex]};
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
 
