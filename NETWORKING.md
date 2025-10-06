@@ -242,7 +242,8 @@ BOULDER includes P2P networking APIs that use Steam IDs instead of IP addresses,
 
 ✅ **API Implementation** - Complete
 ✅ **Virtual Ports** - Working
-📋 **Steam Authentication** - Requires Steamworks SDK integration
+✅ **Steam Authentication** - Fully integrated with Steamworks SDK
+✅ **P2P Networking** - Fully functional!
 
 ### P2P API
 
@@ -260,46 +261,38 @@ conn, _ := session.ConnectP2P(serverSteamID, virtualPort)
 myID := session.GetLocalSteamID()
 ```
 
-### Requirements for Full P2P
+### Requirements for P2P
 
-To enable Steam-authenticated P2P connections:
+✅ **Steamworks SDK is now integrated!** All requirements are met:
 
-1. **Integrate Steamworks SDK**
-   ```cpp
-   #include <steam/steam_api.h>
-   ```
+1. ✅ **Steamworks SDK Integrated**
+   - Located in `third-party/steamworks/`
+   - Headers: `third-party/steamworks/public/steam/`
+   - Library: `third-party/steamworks/redistributable_bin/linux64/libsteam_api.so`
 
-2. **Initialize Steam API**
-   ```cpp
-   // Call before GameNetworkingSockets_Init
-   if (!SteamAPI_Init()) {
-       // Handle error
-   }
-   ```
+2. ✅ **Steam API Initialized**
+   - Automatically called in `boulder_create_network_session()`
+   - Initializes when `boulder.InitWithSteamApp(appId)` is called
+   - Full error handling and logging
 
-3. **Set Steam AppID**
-   - Use your own Steam AppID from Steamworks Partner site
-   - Or use Spacewar (480) for testing
-   - Create `steam_appid.txt` with your AppID
+3. ✅ **Steam AppID Configuration**
+   - Call `boulder.InitWithSteamApp(480)` before creating sessions (Spacewar for testing)
+   - Automatically creates `steam_appid.txt`
+   - Use your own Steam AppID from Steamworks Partner site for production
 
-### Testing Without Full Steam Integration
+### Testing P2P
 
-Until Steamworks SDK is integrated, use these alternatives:
+**With Steam** (Full P2P):
+1. Ensure Steam is running and you're logged in
+2. Call `boulder.InitWithSteamApp(480)` before creating sessions
+3. Create P2P server: `session.StartServerP2P(virtualPort)`
+4. Connect via Steam ID: `session.ConnectP2P(steamID, virtualPort)`
+5. Share your Steam ID with other players using `session.GetLocalSteamID()`
 
-1. **IP-Based Networking** (Recommended)
-   - Works everywhere without Steam
-   - Perfect for LAN and development
-   - Use VPN for internet play
-
-2. **Custom Relay Servers**
-   ```go
-   boulder.SetRelayServer("relay.yourdomain.com", 27020)
-   ```
-
-3. **FakeIP Mode** (Local testing only)
-   ```go
-   boulder.EnableFakeIP()
-   ```
+**Without Steam** (Development/LAN):
+- Use IP-based networking for LAN and development
+- Works everywhere without Steam authentication
+- Perfect for local testing and development
 
 ### P2P Benefits (when authenticated)
 
@@ -311,12 +304,13 @@ Until Steamworks SDK is integrated, use these alternatives:
 
 ## Future Enhancements
 
-- [ ] Full Steamworks SDK integration
+- [x] Full Steamworks SDK integration
 - [ ] Custom relay server infrastructure
 - [ ] Bandwidth monitoring and throttling
 - [ ] Connection quality metrics (ping, packet loss)
-- [ ] Encryption support
 - [ ] Multiple poll groups for connection prioritization
+- [ ] Voice chat integration
+- [ ] Lobby system for matchmaking
 
 ## Credits
 

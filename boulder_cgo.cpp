@@ -17,6 +17,7 @@
 #include <assimp/postprocess.h>
 #include "volk.h"
 #include <shaderc/shaderc.hpp>
+#include <steam/steam_api.h>
 #include <steam/steamnetworkingsockets.h>
 #include <steam/isteamnetworkingutils.h>
 
@@ -1678,6 +1679,7 @@ static bool g_gnsInitialized = false;
 static int g_gnsRefCount = 0;
 static std::mutex g_gnsInitMutex;
 static uint32_t g_steamAppId = 0;
+static bool g_steamAPIInitialized = false;
 
 // Global map to track sessions (needed because GNS doesn't support userdata in all callbacks)
 static std::unordered_map<HSteamListenSocket, BoulderNetworkSession*> g_serverSessions;
@@ -1850,9 +1852,26 @@ NetworkSession boulder_create_network_session() {
         if (!g_gnsInitialized) {
             SteamDatagramErrMsg errMsg;
 
-            // If Steam AppID is set, use it for initialization (enables P2P/Steam features)
+            // If Steam AppID is set, initialize Steam API first
+            if (g_steamAppId != 0 && !g_steamAPIInitialized) {
+                Logger::get().info("Initializing Steam API with AppID {}", g_steamAppId);
+
+                if (!SteamAPI_Init()) {
+                    Logger::get().error("Failed to initialize Steam API!");
+                    Logger::get().error("Make sure:");
+                    Logger::get().error("  1. Steam is running");
+                    Logger::get().error("  2. steam_appid.txt exists with AppID {}", g_steamAppId);
+                    Logger::get().error("  3. You're logged into Steam");
+                    Logger::get().warning("Continuing without Steam authentication (P2P will not work)");
+                } else {
+                    Logger::get().info("✓ Steam API initialized successfully!");
+                    g_steamAPIInitialized = true;
+                }
+            }
+
+            // Initialize GameNetworkingSockets
             if (g_steamAppId != 0) {
-                Logger::get().info("Initializing GameNetworkingSockets with Steam AppID {}", g_steamAppId);
+                Logger::get().info("Initializing GameNetworkingSockets with Steam integration");
             }
 
             if (!GameNetworkingSockets_Init(nullptr, errMsg)) {
@@ -1862,7 +1881,7 @@ NetworkSession boulder_create_network_session() {
             g_gnsInitialized = true;
 
             // If using Steam, wait a moment for authentication
-            if (g_steamAppId != 0) {
+            if (g_steamAppId != 0 && g_steamAPIInitialized) {
                 Logger::get().info("Waiting for Steam authentication...");
                 // Give Steam time to authenticate
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -1929,6 +1948,13 @@ void boulder_destroy_network_session(NetworkSession session) {
         if (g_gnsRefCount == 0 && g_gnsInitialized) {
             GameNetworkingSockets_Kill();
             g_gnsInitialized = false;
+
+            // Shutdown Steam API if it was initialized
+            if (g_steamAPIInitialized) {
+                SteamAPI_Shutdown();
+                g_steamAPIInitialized = false;
+                Logger::get().info("Steam API shutdown");
+            }
         }
     }
 
@@ -1937,6 +1963,11 @@ void boulder_destroy_network_session(NetworkSession session) {
 
 void boulder_network_update(NetworkSession session) {
     if (!session) return;
+
+    // Run Steam API callbacks if initialized
+    if (g_steamAPIInitialized) {
+        SteamAPI_RunCallbacks();
+    }
 
     BoulderNetworkSession* s = static_cast<BoulderNetworkSession*>(session);
     s->interface->RunCallbacks();

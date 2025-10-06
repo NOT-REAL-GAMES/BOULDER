@@ -175,6 +175,24 @@ set(GAMENETWORKINGSOCKETS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(GameNetworkingSockets)
 
+# Add Steamworks SDK
+set(STEAMWORKS_SDK_ROOT "${CMAKE_SOURCE_DIR}/third-party/steamworks")
+set(STEAMWORKS_INCLUDE_DIR "${STEAMWORKS_SDK_ROOT}/public")
+
+# Detect architecture for library path
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(STEAMWORKS_LIB_DIR "${STEAMWORKS_SDK_ROOT}/redistributable_bin/linux64")
+else()
+    set(STEAMWORKS_LIB_DIR "${STEAMWORKS_SDK_ROOT}/redistributable_bin/linux32")
+endif()
+
+# Create imported library for Steam API
+add_library(steam_api SHARED IMPORTED)
+set_target_properties(steam_api PROPERTIES
+    IMPORTED_LOCATION "${STEAMWORKS_LIB_DIR}/libsteam_api.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${STEAMWORKS_INCLUDE_DIR}"
+)
+
 # Set position independent code for all targets when building shared library
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -204,6 +222,7 @@ target_link_libraries(boulder_shared PUBLIC
     glm::glm
     ZLIB::ZLIB
     GameNetworkingSockets
+    steam_api
 )
 
 target_compile_definitions(boulder_shared PUBLIC
@@ -241,6 +260,7 @@ target_link_libraries(Boulder PRIVATE
     volk
     glm::glm
     GameNetworkingSockets
+    steam_api
 )
 
 target_compile_definitions(Boulder PRIVATE
@@ -248,4 +268,15 @@ target_compile_definitions(Boulder PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
     HAS_ASSIMP
     JPH_DOUBLE_PRECISION
+)
+
+# Set RPATH for runtime library location
+set_target_properties(boulder_shared PROPERTIES
+    BUILD_RPATH "${STEAMWORKS_LIB_DIR}"
+    INSTALL_RPATH "${STEAMWORKS_LIB_DIR}"
+)
+
+set_target_properties(Boulder PROPERTIES
+    BUILD_RPATH "${STEAMWORKS_LIB_DIR}"
+    INSTALL_RPATH "${STEAMWORKS_LIB_DIR}"
 )
