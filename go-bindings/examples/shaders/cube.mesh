@@ -1,0 +1,90 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 24, max_primitives = 12) out;
+
+layout(location = 0) out vec3 fragColor[];
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    float time;
+} pc;
+
+void main() {
+    // Cube vertices
+    const vec3 positions[8] = vec3[](
+        vec3(-0.5, -0.5, -0.5),
+        vec3( 0.5, -0.5, -0.5),
+        vec3( 0.5,  0.5, -0.5),
+        vec3(-0.5,  0.5, -0.5),
+        vec3(-0.5, -0.5,  0.5),
+        vec3( 0.5, -0.5,  0.5),
+        vec3( 0.5,  0.5,  0.5),
+        vec3(-0.5,  0.5,  0.5)
+    );
+
+    // Cube face colors
+    const vec3 colors[6] = vec3[](
+        vec3(1.0, 0.0, 0.0), // -Z (red)
+        vec3(0.0, 1.0, 0.0), // +Z (green)
+        vec3(0.0, 0.0, 1.0), // -X (blue)
+        vec3(1.0, 1.0, 0.0), // +X (yellow)
+        vec3(1.0, 0.0, 1.0), // -Y (magenta)
+        vec3(0.0, 1.0, 1.0)  // +Y (cyan)
+    );
+
+    // Cube faces (4 vertices per face)
+    const uint indices[24] = uint[](
+        // -Z face
+        1, 0, 3, 2,
+        // +Z face
+        4, 5, 6, 7,
+        // -X face
+        0, 4, 7, 3,
+        // +X face
+        5, 1, 2, 6,
+        // -Y face
+        5, 4, 0, 1,
+        // +Y face
+        2, 3, 7, 6
+    );
+
+    SetMeshOutputsEXT(24, 12);
+
+    // Rotation matrix around Y axis
+    float angle = pc.time;
+    mat4 rotation = mat4(
+        cos(angle), 0.0, sin(angle), 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        -sin(angle), 0.0, cos(angle), 0.0,
+        0.0, 0.0, 0.0, 1.0
+    );
+
+    // Generate vertices
+    for (uint i = 0; i < 24; i++) {
+        vec3 pos = positions[indices[i]];
+        vec4 worldPos = rotation * vec4(pos, 1.0);
+        gl_MeshVerticesEXT[i].gl_Position = pc.viewProj * worldPos;
+        fragColor[i] = colors[i / 4];
+    }
+
+    // Generate triangles (2 per face)
+    for (uint face = 0; face < 6; face++) {
+        uint baseVertex = face * 4;
+
+        // First triangle
+        gl_PrimitiveTriangleIndicesEXT[face * 2] = uvec3(
+            baseVertex + 0,
+            baseVertex + 1,
+            baseVertex + 2
+        );
+
+        // Second triangle
+        gl_PrimitiveTriangleIndicesEXT[face * 2 + 1] = uvec3(
+            baseVertex + 0,
+            baseVertex + 2,
+            baseVertex + 3
+        );
+    }
+}

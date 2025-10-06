@@ -1,6 +1,8 @@
 #ifndef BOULDER_CGO_H
 #define BOULDER_CGO_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,6 +48,33 @@ void boulder_get_mouse_position(float* x, float* y);
 // Logging
 void boulder_log_info(const char* message);
 void boulder_log_error(const char* message);
+
+// Shader management
+typedef unsigned long long ShaderModuleID;
+ShaderModuleID boulder_compile_shader(const char* source, int shaderKind, const char* name);
+void boulder_destroy_shader_module(ShaderModuleID shaderId);
+ShaderModuleID boulder_reload_shader(ShaderModuleID shaderId, const char* source, int shaderKind, const char* name);
+
+// Pipeline management
+typedef unsigned long long PipelineID;
+PipelineID boulder_create_graphics_pipeline(ShaderModuleID meshShader, ShaderModuleID fragShader);
+void boulder_bind_pipeline(PipelineID pipelineId);
+void boulder_destroy_pipeline(PipelineID pipelineId);
+
+// Rendering control
+int boulder_begin_frame(uint32_t* imageIndex);
+int boulder_end_frame(uint32_t imageIndex);
+void boulder_set_clear_color(float r, float g, float b, float a);
+void boulder_set_viewport(float x, float y, float width, float height, float minDepth, float maxDepth);
+void boulder_set_scissor(int x, int y, int width, int height);
+
+// Draw commands
+void boulder_draw_mesh(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+void boulder_set_push_constants(const void* data, uint32_t size, uint32_t offset);
+
+// Swapchain management
+void boulder_get_swapchain_extent(int* width, int* height);
+int boulder_recreate_swapchain();
 
 #ifdef __cplusplus
 }

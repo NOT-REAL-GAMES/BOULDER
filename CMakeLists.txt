@@ -22,6 +22,62 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(glm)
 
 FetchContent_Declare(
+    SPIRV-Cross
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+    GIT_TAG "main"
+)
+
+FetchContent_MakeAvailable(SPIRV-Cross)
+
+# Fetch SPIRV-Headers (required by SPIRV-Tools)
+FetchContent_Declare(
+    SPIRV-Headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+    GIT_TAG main
+)
+
+FetchContent_MakeAvailable(SPIRV-Headers)
+
+# Fetch SPIRV-Tools (required by shaderc)
+FetchContent_Declare(
+    SPIRV-Tools
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
+    GIT_TAG main
+)
+
+set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(SPIRV-Tools)
+
+# Fetch glslang (required by shaderc)
+FetchContent_Declare(
+    glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG main
+)
+
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(glslang)
+
+# Now fetch shaderc
+FetchContent_Declare(
+    shaderc
+    GIT_REPOSITORY https://github.com/google/shaderc.git
+    GIT_TAG main
+)
+
+set(SHADERC_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SHADERC_SKIP_EXAMPLES ON CACHE BOOL "" FORCE)
+set(SHADERC_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+set(SHADERC_SKIP_COPYRIGHT_CHECK ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(shaderc)
+
+
+FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG "main"
@@ -126,6 +182,9 @@ target_include_directories(boulder_shared PUBLIC
 find_package(ZLIB REQUIRED)
 
 target_link_libraries(boulder_shared PUBLIC
+    spirv-cross-core
+    spirv-cross-glsl
+    shaderc
     SDL3
     Threads::Threads
     assimp
@@ -160,6 +219,9 @@ target_include_directories(Boulder PRIVATE
 )
 
 target_link_libraries(Boulder PRIVATE
+    spirv-cross-core
+    spirv-cross-glsl
+    shaderc
     SDL3
     Threads::Threads
     assimp
