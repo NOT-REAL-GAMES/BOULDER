@@ -120,6 +120,35 @@ typedef struct {
 int boulder_poll_network_event(NetworkSession session, NetworkEvent* event);
 void boulder_free_network_event_data(void* data);
 
+// UI Overlay System
+typedef uint64_t UIButtonID;
+
+// UI initialization (called automatically during boulder_init)
+int boulder_ui_init();
+void boulder_ui_cleanup();
+
+// Button creation and management
+UIButtonID boulder_ui_create_button(float x, float y, float width, float height,
+                                    float normalR, float normalG, float normalB, float normalA,
+                                    float hoverR, float hoverG, float hoverB, float hoverA,
+                                    float pressedR, float pressedG, float pressedB, float pressedA);
+void boulder_ui_destroy_button(UIButtonID buttonId);
+void boulder_ui_set_button_position(UIButtonID buttonId, float x, float y);
+void boulder_ui_set_button_size(UIButtonID buttonId, float width, float height);
+void boulder_ui_set_button_enabled(UIButtonID buttonId, int enabled);
+
+// Input handling (should be called from event loop)
+void boulder_ui_handle_mouse_move(float x, float y);
+void boulder_ui_handle_mouse_down(float x, float y);
+void boulder_ui_handle_mouse_up(float x, float y);
+
+// Button interaction checking
+int boulder_ui_button_was_clicked(UIButtonID buttonId);
+void boulder_ui_reset_button_click(UIButtonID buttonId);
+
+// Rendering (called during frame rendering)
+void boulder_ui_render(uint32_t imageIndex);
+
 #ifdef __cplusplus
 }
 #endif

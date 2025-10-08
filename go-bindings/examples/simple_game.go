@@ -13,8 +13,12 @@ func vkMakeVersion(major, minor, patch uint32) uint32 {
 }
 
 func main() {
-	// Create and initialize the engine
+
+	boulder.InitWithSteamApp(4098700)
+
 	engine := boulder.NewEngine("YOUR GAME NAME HERE", vkMakeVersion(0, 0, 1))
+
+	// Create and initialize the engine
 
 	boulder.LogInfo("Starting Boulder Engine from Go!")
 
@@ -22,6 +26,41 @@ func main() {
 		log.Fatalf("Failed to initialize engine: %v", err)
 	}
 	defer engine.Shutdown()
+
+	server, err := boulder.NewNetworkSession(engine)
+	if err != nil {
+		boulder.LogError(fmt.Sprintf("Failed to create server: %v", err))
+		return
+	}
+	defer server.Destroy()
+
+	server.SetLocalIdentity("P2P Server")
+	if err := server.StartServerP2P(1000); err != nil {
+		boulder.LogError(fmt.Sprintf("Failed to start P2P server: %v (Steam running?)", err))
+		return
+	}
+	defer server.StopServer()
+
+	serverSteamID := server.GetLocalSteamID()
+
+	client, err := boulder.NewNetworkSession(engine)
+	if err != nil {
+		boulder.LogError(fmt.Sprintf("Failed to create client: %v", err))
+		return
+	}
+	defer client.Destroy()
+
+	client.SetLocalIdentity("P2P Client")
+	clientSteamID := client.GetLocalSteamID()
+	boulder.LogInfo(fmt.Sprintf("✓ P2P Client created (Steam ID: %d)", clientSteamID))
+
+	// Connect P2P
+	conn, err := client.ConnectP2P(serverSteamID, 1000)
+	if err != nil {
+		boulder.LogError(fmt.Sprintf("Failed to connect P2P: %v", err))
+		return
+	}
+	defer client.Disconnect(conn)
 
 	// Create modular subsystems
 	window := boulder.NewWindow(engine)
@@ -93,8 +132,38 @@ func main() {
 	fpsTime := time.Now()
 
 	boulder.LogInfo("Starting main loop")
+	connected := false
 
 	for !window.ShouldClose() {
+
+		server.Update()
+		client.Update()
+
+		for {
+			event := server.PollEvent()
+			if event == nil {
+				break
+			}
+			if _, ok := event.(boulder.ConnectedEvent); ok {
+				boulder.LogInfo("[SERVER] P2P client connected!")
+			}
+		}
+
+		for {
+			event := client.PollEvent()
+			if event == nil {
+				break
+			}
+			if _, ok := event.(boulder.ConnectedEvent); ok {
+				boulder.LogInfo("[CLIENT] P2P connection established!")
+				connected = true
+			}
+		}
+
+		if !connected {
+			boulder.LogInfo("oh nauer")
+		}
+
 		// Calculate delta time
 		currentTime := time.Now()
 		deltaTime := float32(currentTime.Sub(lastTime).Seconds())

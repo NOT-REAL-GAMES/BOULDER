@@ -1,6 +1,7 @@
 
 #include "main.h"
 #include "boulder_cgo.h"
+#include "ui_renderer.h"
 #include <iostream>
 #include <memory>
 #include <unordered_map>
@@ -70,6 +71,10 @@ static struct {
     VkCommandBuffer activeCommandBuffer = nullptr;
     uint32_t currentFrameIndex = 0;
     VkClearColorValue clearColor = {{0.1f, 0.2f, 0.3f, 1.0f}};
+
+    // UI System
+    std::unique_ptr<boulder::UIRenderer> uiRenderer;
+    std::unordered_map<uint64_t, bool> buttonClickStates;
 } g_engine;
 
 // Transform component
@@ -2247,6 +2252,158 @@ void boulder_free_network_event_data(void* data) {
     if (data) {
         delete[] static_cast<uint8_t*>(data);
     }
+}
+
+// ============================================================================
+// UI System Implementation
+// ============================================================================
+
+int boulder_ui_init() {
+    if (!g_engine.device || !g_engine.physicalDevice) {
+        Logger::get().error("Cannot initialize UI: Vulkan not initialized");
+        return -1;
+    }
+
+    g_engine.uiRenderer = std::make_unique<boulder::UIRenderer>();
+
+    if (!g_engine.uiRenderer->initialize(g_engine.device, g_engine.physicalDevice,
+                                         g_engine.swapchainFormat, g_engine.commandPool,
+                                         g_engine.graphicsQueue, g_engine.graphicsQueueFamily)) {
+        Logger::get().error("Failed to initialize UI renderer");
+        g_engine.uiRenderer.reset();
+        return -1;
+    }
+
+    // Set initial screen size
+    g_engine.uiRenderer->updateScreenSize(g_engine.swapchainExtent.width,
+                                         g_engine.swapchainExtent.height);
+
+    Logger::get().info("UI system initialized successfully");
+    return 0;
+}
+
+void boulder_ui_cleanup() {
+    if (g_engine.uiRenderer) {
+        g_engine.uiRenderer->cleanup();
+        g_engine.uiRenderer.reset();
+    }
+    g_engine.buttonClickStates.clear();
+}
+
+UIButtonID boulder_ui_create_button(float x, float y, float width, float height,
+                                    float normalR, float normalG, float normalB, float normalA,
+                                    float hoverR, float hoverG, float hoverB, float hoverA,
+                                    float pressedR, float pressedG, float pressedB, float pressedA) {
+    if (!g_engine.uiRenderer) {
+        Logger::get().error("UI renderer not initialized");
+        return 0;
+    }
+
+    glm::vec2 position(x, y);
+    glm::vec2 size(width, height);
+    glm::vec4 normalColor(normalR, normalG, normalB, normalA);
+    glm::vec4 hoverColor(hoverR, hoverG, hoverB, hoverA);
+    glm::vec4 pressedColor(pressedR, pressedG, pressedB, pressedA);
+
+    UIButtonID buttonId = g_engine.uiRenderer->createButton(position, size, normalColor,
+                                                            hoverColor, pressedColor);
+
+    // Set up click tracking
+    g_engine.buttonClickStates[buttonId] = false;
+
+    // Set up callback to track clicks
+    g_engine.uiRenderer->setButtonCallback(buttonId, [buttonId]() {
+        g_engine.buttonClickStates[buttonId] = true;
+    });
+
+    return buttonId;
+}
+
+void boulder_ui_destroy_button(UIButtonID buttonId) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->destroyButton(buttonId);
+    g_engine.buttonClickStates.erase(buttonId);
+}
+
+void boulder_ui_set_button_position(UIButtonID buttonId, float x, float y) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->setButtonPosition(buttonId, glm::vec2(x, y));
+}
+
+void boulder_ui_set_button_size(UIButtonID buttonId, float width, float height) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->setButtonSize(buttonId, glm::vec2(width, height));
+}
+
+void boulder_ui_set_button_enabled(UIButtonID buttonId, int enabled) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->setButtonEnabled(buttonId, enabled != 0);
+}
+
+void boulder_ui_handle_mouse_move(float x, float y) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->handleMouseMove(x, y);
+}
+
+void boulder_ui_handle_mouse_down(float x, float y) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->handleMouseDown(x, y);
+}
+
+void boulder_ui_handle_mouse_up(float x, float y) {
+    if (!g_engine.uiRenderer) {
+        return;
+    }
+
+    g_engine.uiRenderer->handleMouseUp(x, y);
+}
+
+int boulder_ui_button_was_clicked(UIButtonID buttonId) {
+    auto it = g_engine.buttonClickStates.find(buttonId);
+    if (it != g_engine.buttonClickStates.end()) {
+        return it->second ? 1 : 0;
+    }
+    return 0;
+}
+
+void boulder_ui_reset_button_click(UIButtonID buttonId) {
+    auto it = g_engine.buttonClickStates.find(buttonId);
+    if (it != g_engine.buttonClickStates.end()) {
+        it->second = false;
+    }
+}
+
+void boulder_ui_render(uint32_t imageIndex) {
+    if (!g_engine.uiRenderer || !g_engine.activeCommandBuffer) {
+        return;
+    }
+
+    if (imageIndex >= g_engine.swapchainImages.size()) {
+        Logger::get().error("Invalid image index for UI rendering");
+        return;
+    }
+
+    g_engine.uiRenderer->render(g_engine.activeCommandBuffer, g_engine.swapchainExtent,
+                                g_engine.swapchainImages[imageIndex],
+                                g_engine.swapchainImageViews[imageIndex]);
 }
 
 } // extern "C"

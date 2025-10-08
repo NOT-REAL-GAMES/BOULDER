@@ -12,10 +12,6 @@ import (
 // P2P Demo - Shows how to use Steam Datagram Relay for P2P connections
 // This uses virtual ports instead of real IP addresses for easier NAT traversal
 
-func vkMakeVersion(major, minor, patch uint32) uint32 {
-	return uint32(major<<22 | minor<<12 | patch)
-}
-
 func testP2PWithSpacewar(engine *boulder.Engine) {
 	boulder.LogInfo("\n=== P2P with Spacewar AppID ===")
 	boulder.LogInfo("NOTE: This requires Steam to be running!")
@@ -281,8 +277,4 @@ func p2p_demo() {
 	boulder.LogInfo(strings.Repeat("=", 60))
 
 	boulder.LogInfo("\n=== Demo Complete ===")
-}
-
-func main() {
-	p2p_demo()
 }

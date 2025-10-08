@@ -199,6 +199,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Build shared library for CGO bindings
 add_library(boulder_shared SHARED
     boulder_cgo.cpp
+    ui_renderer.cpp
 )
 
 target_include_directories(boulder_shared PUBLIC
