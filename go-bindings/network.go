@@ -324,3 +324,51 @@ func (ns *NetworkSession) PollEvents() []NetworkEvent {
 
 	return events
 }
+
+// IsValid returns true if this is a real network session (not a dummy)
+func (ns *NetworkSession) IsValid() bool {
+	return ns != nil && ns.handle != nil
+}
+
+// ============================================================================
+// Dummy Network Session (Null Object Pattern)
+// ============================================================================
+
+// DummyNetworkSession is a no-op network session that can be used when disconnected
+// This avoids nil pointer checks throughout the code
+type DummyNetworkSession struct{}
+
+// NewDummyNetworkSession creates a dummy network session
+func NewDummyNetworkSession() *NetworkSession {
+	return &NetworkSession{
+		handle: nil,
+		engine: nil,
+	}
+}
+
+// Helper function to check if a session is a dummy
+func IsDummySession(ns *NetworkSession) bool {
+	return ns == nil || ns.handle == nil
+}
+
+// All methods on DummyNetworkSession are no-ops that return safe defaults
+// This is already handled by the existing nil checks in NetworkSession methods,
+// but we can add explicit documentation here
+
+// Example usage:
+//
+//   var server *NetworkSession = NewDummyNetworkSession()
+//
+//   // Later, when actually connecting:
+//   if userClickedConnect {
+//       server.Destroy() // Safe to call on dummy
+//       server, err = NewNetworkSession(engine)
+//       if err != nil {
+//           server = NewDummyNetworkSession() // Fall back to dummy
+//       }
+//   }
+//
+//   // Always safe to call, even on dummy:
+//   server.Update()
+//   event := server.PollEvent() // Returns nil
+//   server.SendMessage(conn, data, true) // Returns error

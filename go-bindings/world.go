@@ -116,6 +116,30 @@ func (e *Entity) GetTransform() (Vector3, error) {
 	return Vector3{X: float32(x), Y: float32(y), Z: float32(z)}, nil
 }
 
+// GetFullTransform gets the complete transform (position, rotation, scale) of an entity
+func (e *Entity) GetFullTransform() (position, rotation, scale Vector3, err error) {
+	if !e.world.engine.initialized {
+		return Vector3{}, Vector3{}, Vector3{}, errors.New("engine not initialized")
+	}
+
+	var px, py, pz C.float
+	var rx, ry, rz C.float
+	var sx, sy, sz C.float
+
+	if ret := C.boulder_get_full_transform(C.EntityID(e.ID),
+		&px, &py, &pz,
+		&rx, &ry, &rz,
+		&sx, &sy, &sz); ret != 0 {
+		return Vector3{}, Vector3{}, Vector3{}, errors.New("failed to get full transform")
+	}
+
+	position = Vector3{X: float32(px), Y: float32(py), Z: float32(pz)}
+	rotation = Vector3{X: float32(rx), Y: float32(ry), Z: float32(rz)}
+	scale = Vector3{X: float32(sx), Y: float32(sy), Z: float32(sz)}
+
+	return position, rotation, scale, nil
+}
+
 // SetTransform sets the transform position of an entity
 func (e *Entity) SetTransform(position Vector3) error {
 	if !e.world.engine.initialized {
@@ -125,6 +149,23 @@ func (e *Entity) SetTransform(position Vector3) error {
 	if ret := C.boulder_set_transform(C.EntityID(e.ID),
 		C.float(position.X), C.float(position.Y), C.float(position.Z)); ret != 0 {
 		return errors.New("failed to set transform")
+	}
+
+	return nil
+}
+
+// SetFullTransform sets the complete transform (position, rotation, scale) of an entity
+// Rotation is in radians
+func (e *Entity) SetFullTransform(position, rotation, scale Vector3) error {
+	if !e.world.engine.initialized {
+		return errors.New("engine not initialized")
+	}
+
+	if ret := C.boulder_set_full_transform(C.EntityID(e.ID),
+		C.float(position.X), C.float(position.Y), C.float(position.Z),
+		C.float(rotation.X), C.float(rotation.Y), C.float(rotation.Z),
+		C.float(scale.X), C.float(scale.Y), C.float(scale.Z)); ret != 0 {
+		return errors.New("failed to set full transform")
 	}
 
 	return nil

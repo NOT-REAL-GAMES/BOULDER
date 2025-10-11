@@ -29,7 +29,15 @@ int boulder_entity_exists(EntityID entity);
 // Component operations
 int boulder_add_transform(EntityID entity, float x, float y, float z);
 int boulder_get_transform(EntityID entity, float* x, float* y, float* z);
+int boulder_get_full_transform(EntityID entity,
+                               float* px, float* py, float* pz,
+                               float* rx, float* ry, float* rz,
+                               float* sx, float* sy, float* sz);
 int boulder_set_transform(EntityID entity, float x, float y, float z);
+int boulder_set_full_transform(EntityID entity,
+                               float px, float py, float pz,
+                               float rx, float ry, float rz,
+                               float sx, float sy, float sz);
 
 // Physics
 int boulder_add_physics_body(EntityID entity, float mass);
@@ -64,6 +72,7 @@ void boulder_destroy_pipeline(PipelineID pipelineId);
 // Rendering control
 int boulder_begin_frame(uint32_t* imageIndex);
 int boulder_end_frame(uint32_t imageIndex);
+void boulder_render_models();  // Render all entities with Model components
 void boulder_set_clear_color(float r, float g, float b, float a);
 void boulder_set_viewport(float x, float y, float width, float height, float minDepth, float maxDepth);
 void boulder_set_scissor(int x, int y, int width, int height);

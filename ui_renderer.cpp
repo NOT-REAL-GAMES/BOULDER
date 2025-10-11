@@ -22,8 +22,9 @@ layout(location = 0) out vec4 fragColor;
 
 void main() {
     // Convert screen-space coordinates to NDC (-1 to 1)
+    // In Vulkan NDC: (-1,-1) is top-left, (1,1) is bottom-right
+    // Screen space: (0,0) is top-left, (width,height) is bottom-right
     vec2 ndc = (inPosition / pushConstants.screenSize) * 2.0 - 1.0;
-    ndc.y = -ndc.y;  // Flip Y axis (Vulkan's Y points down in screen space)
 
     gl_Position = vec4(ndc, 0.0, 1.0);
     fragColor = inColor;

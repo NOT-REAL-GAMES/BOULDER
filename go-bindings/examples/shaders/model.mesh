@@ -1,0 +1,80 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// Mesh shader workgroup size - 32 threads per workgroup
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 32, max_primitives = 10) out;
+
+layout(location = 0) out vec3 fragNormal[];
+layout(location = 1) out vec2 fragTexCoord[];
+layout(location = 2) out vec3 fragWorldPos[];
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    mat4 model;
+    uint vertexOffset;
+    uint indexOffset;
+} pc;
+
+// Storage buffers for vertex and index data
+// Using explicit offsets to guarantee layout matches C++ (std430 is tightly packed)
+struct Vertex {
+    vec3 position;  // offset 0, 12 bytes
+    vec3 normal;    // offset 12, 12 bytes
+    vec2 texCoord;  // offset 24, 8 bytes
+    // Total: 32 bytes per vertex
+};
+
+layout(std430, binding = 0) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(std430, binding = 1) readonly buffer IndexBuffer {
+    uint indices[];
+};
+
+layout(std430, binding = 2) readonly buffer DrawParams {
+    uint indexCount;
+    uint instanceCount;
+} drawParams;
+
+void main() {
+    uint threadId = gl_LocalInvocationIndex;
+    uint workgroupId = gl_WorkGroupID.x;
+
+    // Calculate which indices this workgroup handles (30 indices = 10 triangles per workgroup)
+    // Use 30 instead of 32 to ensure we always have complete triangles
+    uint baseIndex = workgroupId * 30;
+    uint numIndices = drawParams.indexCount;
+    uint remainingIndices = numIndices - baseIndex;
+    uint workgroupIndices = min(30, remainingIndices);
+    // Round down to complete triangles only
+    uint numPrimitives = workgroupIndices / 3;
+    workgroupIndices = numPrimitives * 3;
+
+    // Set mesh outputs for this workgroup
+    SetMeshOutputsEXT(workgroupIndices, numPrimitives);
+
+    // Each thread processes one index
+    if (threadId < workgroupIndices) {
+        uint globalIndex = baseIndex + threadId;
+        uint index = indices[pc.indexOffset + globalIndex];
+        Vertex v = vertices[pc.vertexOffset + index];
+
+        vec4 worldPos = pc.model * vec4(v.position, 1.0);
+        gl_MeshVerticesEXT[threadId].gl_Position = pc.viewProj * worldPos;
+
+        fragWorldPos[threadId] = worldPos.xyz;
+        // Transform normal (assuming uniform scaling)
+        fragNormal[threadId] = normalize(mat3(pc.model) * v.normal);
+        fragTexCoord[threadId] = v.texCoord;
+    }
+
+    // First thread generates triangle indices
+    if (threadId == 0) {
+        for (uint i = 0; i < numPrimitives; i++) {
+            uint baseIdx = i * 3;
+            gl_PrimitiveTriangleIndicesEXT[i] = uvec3(baseIdx, baseIdx + 1, baseIdx + 2);
+        }
+    }
+}

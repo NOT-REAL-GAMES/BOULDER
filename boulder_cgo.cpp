@@ -23,7 +23,7 @@
 #include <steam/isteamnetworkingutils.h>
 
 // Maximum frames that can be processed simultaneously
-constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 3;
 
 // Global state for the engine
 static struct {
@@ -43,21 +43,37 @@ static struct {
     std::vector<VkImageView> swapchainImageViews;
     VkFormat swapchainFormat;
     VkExtent2D swapchainExtent;
+
+    // Depth buffer
+    VkImage depthImage = nullptr;
+    VkImageView depthImageView = nullptr;
+    VkDeviceMemory depthImageMemory = nullptr;
+    VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+
     VkCommandPool commandPool = nullptr;
     std::vector<VkCommandBuffer> commandBuffers;
 
     // Per-frame synchronization (fixed size for frames in flight)
     VkSemaphore imageAvailableSemaphores[MAX_FRAMES_IN_FLIGHT];
+    VkSemaphore renderFinishedSemaphores[MAX_FRAMES_IN_FLIGHT];
     VkFence inFlightFences[MAX_FRAMES_IN_FLIGHT];
 
-    // Per-swapchain-image semaphores (must be separate per image for present)
-    std::vector<VkSemaphore> renderFinishedSemaphores;
+    // Per-image fence tracking (which frame is using which image)
+    std::vector<VkFence> imagesInFlight; // Initially VK_NULL_HANDLE, set to frame fence when image is acquired
 
     uint32_t graphicsQueueFamily = UINT32_MAX;
     VkPipelineLayout pipelineLayout = nullptr;
     VkPipeline cubePipeline = nullptr;
     VkShaderModule meshShaderModule = nullptr;
     VkShaderModule fragShaderModule = nullptr;
+
+    // Model rendering pipeline (mesh + fragment)
+    VkPipeline modelPipeline = nullptr;
+    VkPipelineLayout modelPipelineLayout = nullptr;
+    VkShaderModule modelMeshShader = nullptr;
+    VkShaderModule modelFragShader = nullptr;
+    VkDescriptorSetLayout modelDescriptorSetLayout = nullptr;
+    VkDescriptorPool modelDescriptorPools[MAX_FRAMES_IN_FLIGHT] = {}; // One pool per frame-in-flight
     flecs::world* ecs = nullptr;
     std::unique_ptr<Assimp::Importer> importer;
 
@@ -91,10 +107,42 @@ struct PhysicsBody {
     glm::vec3 acceleration;
 };
 
+// Vertex structure for loaded models - matches GLSL std430 layout
+struct Vertex {
+    glm::vec3 position;  // 12 bytes, offset 0
+    glm::vec3 normal;    // 12 bytes, offset 12
+    glm::vec2 texCoord;  // 8 bytes, offset 24
+    // Total: 32 bytes (naturally aligned for std430)
+};
+
+// Verify struct layout matches GLSL std430
+static_assert(sizeof(Vertex) == 32, "Vertex struct size must be 32 bytes to match GLSL std430 layout");
+static_assert(offsetof(Vertex, position) == 0, "position offset must be 0");
+static_assert(offsetof(Vertex, normal) == 12, "normal offset must be 12");
+static_assert(offsetof(Vertex, texCoord) == 24, "texCoord offset must be 24");
+
+// Mesh structure with GPU buffers
+struct Mesh {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    VkBuffer vertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer indexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer drawParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory drawParamsBufferMemory = VK_NULL_HANDLE;
+    uint32_t indexCount = 0;
+
+    ~Mesh() {
+        // Cleanup is handled separately to ensure proper Vulkan device context
+    }
+};
+
 // Model component
 struct Model {
     std::string path;
     const aiScene* scene;
+    std::vector<Mesh> meshes;
 };
 
 // Shader compilation helper
@@ -124,6 +172,8 @@ int boulder_init(const char* appName, uint version) {
     if (g_engine.initialized) {
         return 0;
     }
+
+    setenv("SDL_VIDEODRIVER", "x11", 1);
     
     // Try to initialize SDL with just events first
     if (!SDL_Init(SDL_INIT_EVENTS)) {
@@ -214,15 +264,15 @@ int boulder_init(const char* appName, uint version) {
         }
 
         // Enable validation layers for debugging
-        const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
+        const char* validationLayers[] = {}; //VK_LAYER_KHRONOS_validation
 
         VkInstanceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = sdlExtensionCount + additionalExtensionCount;
         createInfo.ppEnabledExtensionNames = instanceExtensions.get();
-        createInfo.enabledLayerCount = 1;
-        createInfo.ppEnabledLayerNames = validationLayers;
+        createInfo.enabledLayerCount = 0;
+        createInfo.ppEnabledLayerNames = nullptr;
 
         // Create the Vulkan instance now while pointers are valid
         err = vkCreateInstance(&createInfo, nullptr, &g_engine.instance);
@@ -240,6 +290,9 @@ int boulder_init(const char* appName, uint version) {
     return 0;
 }
 
+// Forward declaration
+static void destroyDepthResources();
+
 void boulder_shutdown() {
     if (!g_engine.initialized) {
         return;
@@ -251,6 +304,9 @@ void boulder_shutdown() {
     if (g_engine.device) {
         vkDeviceWaitIdle(g_engine.device);
     }
+
+    // Cleanup UI system after device is idle
+    boulder_ui_cleanup();
 
     // Cleanup Vulkan resources
     if (g_engine.device) {
@@ -272,15 +328,39 @@ void boulder_shutdown() {
             g_engine.fragShaderModule = nullptr;
         }
 
+        // Cleanup model rendering pipeline and resources
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-            vkDestroySemaphore(g_engine.device, g_engine.imageAvailableSemaphores[i], nullptr);
-            vkDestroyFence(g_engine.device, g_engine.inFlightFences[i], nullptr);
+            if (g_engine.modelDescriptorPools[i]) {
+                vkDestroyDescriptorPool(g_engine.device, g_engine.modelDescriptorPools[i], nullptr);
+                g_engine.modelDescriptorPools[i] = nullptr;
+            }
+        }
+        if (g_engine.modelDescriptorSetLayout) {
+            vkDestroyDescriptorSetLayout(g_engine.device, g_engine.modelDescriptorSetLayout, nullptr);
+            g_engine.modelDescriptorSetLayout = nullptr;
+        }
+        if (g_engine.modelPipeline) {
+            vkDestroyPipeline(g_engine.device, g_engine.modelPipeline, nullptr);
+            g_engine.modelPipeline = nullptr;
+        }
+        if (g_engine.modelPipelineLayout) {
+            vkDestroyPipelineLayout(g_engine.device, g_engine.modelPipelineLayout, nullptr);
+            g_engine.modelPipelineLayout = nullptr;
+        }
+        if (g_engine.modelMeshShader) {
+            vkDestroyShaderModule(g_engine.device, g_engine.modelMeshShader, nullptr);
+            g_engine.modelMeshShader = nullptr;
+        }
+        if (g_engine.modelFragShader) {
+            vkDestroyShaderModule(g_engine.device, g_engine.modelFragShader, nullptr);
+            g_engine.modelFragShader = nullptr;
         }
 
-        for (auto sem : g_engine.renderFinishedSemaphores) {
-            vkDestroySemaphore(g_engine.device, sem, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(g_engine.device, g_engine.imageAvailableSemaphores[i], nullptr);
+            vkDestroySemaphore(g_engine.device, g_engine.renderFinishedSemaphores[i], nullptr);
+            vkDestroyFence(g_engine.device, g_engine.inFlightFences[i], nullptr);
         }
-        g_engine.renderFinishedSemaphores.clear();
         if (g_engine.commandPool) {
             vkDestroyCommandPool(g_engine.device, g_engine.commandPool, nullptr);
             g_engine.commandPool = nullptr;
@@ -289,6 +369,7 @@ void boulder_shutdown() {
             vkDestroyImageView(g_engine.device, imageView, nullptr);
         }
         g_engine.swapchainImageViews.clear();
+        destroyDepthResources();
         if (g_engine.swapchain) {
             vkDestroySwapchainKHR(g_engine.device, g_engine.swapchain, nullptr);
             g_engine.swapchain = nullptr;
@@ -309,6 +390,39 @@ void boulder_shutdown() {
     if (g_engine.window) {
         SDL_DestroyWindow(g_engine.window);
         g_engine.window = nullptr;
+    }
+
+    // Cleanup model buffers from all entities before deleting ECS
+    if (g_engine.ecs && g_engine.device) {
+        auto query = g_engine.ecs->query<Model>();
+        query.each([](Model& model) {
+            for (auto& mesh : model.meshes) {
+                if (mesh.vertexBuffer != VK_NULL_HANDLE) {
+                    vkDestroyBuffer(g_engine.device, mesh.vertexBuffer, nullptr);
+                    mesh.vertexBuffer = VK_NULL_HANDLE;
+                }
+                if (mesh.vertexBufferMemory != VK_NULL_HANDLE) {
+                    vkFreeMemory(g_engine.device, mesh.vertexBufferMemory, nullptr);
+                    mesh.vertexBufferMemory = VK_NULL_HANDLE;
+                }
+                if (mesh.indexBuffer != VK_NULL_HANDLE) {
+                    vkDestroyBuffer(g_engine.device, mesh.indexBuffer, nullptr);
+                    mesh.indexBuffer = VK_NULL_HANDLE;
+                }
+                if (mesh.indexBufferMemory != VK_NULL_HANDLE) {
+                    vkFreeMemory(g_engine.device, mesh.indexBufferMemory, nullptr);
+                    mesh.indexBufferMemory = VK_NULL_HANDLE;
+                }
+                if (mesh.drawParamsBuffer != VK_NULL_HANDLE) {
+                    vkDestroyBuffer(g_engine.device, mesh.drawParamsBuffer, nullptr);
+                    mesh.drawParamsBuffer = VK_NULL_HANDLE;
+                }
+                if (mesh.drawParamsBufferMemory != VK_NULL_HANDLE) {
+                    vkFreeMemory(g_engine.device, mesh.drawParamsBufferMemory, nullptr);
+                    mesh.drawParamsBufferMemory = VK_NULL_HANDLE;
+                }
+            }
+        });
     }
 
     delete g_engine.ecs;
@@ -336,6 +450,247 @@ int boulder_update(float deltaTime) {
     return 0;
 }
 
+// Helper function to find suitable memory type
+static uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(g_engine.physicalDevice, &memProperties);
+
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) &&
+            (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+
+    Logger::get().error("Failed to find suitable memory type");
+    return 0;
+}
+
+// Helper function to create a Vulkan buffer
+static bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+                        VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(g_engine.device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        Logger::get().error("Failed to create buffer");
+        return false;
+    }
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(g_engine.device, buffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(g_engine.device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+        Logger::get().error("Failed to allocate buffer memory");
+        return false;
+    }
+
+    vkBindBufferMemory(g_engine.device, buffer, bufferMemory, 0);
+    return true;
+}
+
+// Helper function to copy data to a buffer
+static void copyDataToBuffer(VkDeviceMemory bufferMemory, const void* data, size_t size) {
+    void* mapped;
+    vkMapMemory(g_engine.device, bufferMemory, 0, size, 0, &mapped);
+    memcpy(mapped, data, size);
+    vkUnmapMemory(g_engine.device, bufferMemory);
+}
+
+// Helper function to process a single Assimp mesh
+static Mesh processMesh(aiMesh* mesh) {
+    Mesh result;
+
+    // Extract vertices
+    for (uint32_t i = 0; i < mesh->mNumVertices; i++) {
+        Vertex vertex;
+
+        // Position
+        vertex.position = glm::vec3(
+            mesh->mVertices[i].x,
+            mesh->mVertices[i].y,
+            mesh->mVertices[i].z
+        );
+
+        // Normal
+        if (mesh->HasNormals()) {
+            vertex.normal = glm::vec3(
+                mesh->mNormals[i].x,
+                mesh->mNormals[i].y,
+                mesh->mNormals[i].z
+            );
+        } else {
+            vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+        }
+
+        // Texture coordinates
+        if (mesh->mTextureCoords[0]) {
+            vertex.texCoord = glm::vec2(
+                mesh->mTextureCoords[0][i].x,
+                mesh->mTextureCoords[0][i].y
+            );
+        } else {
+            vertex.texCoord = glm::vec2(0.0f, 0.0f);
+        }
+
+        result.vertices.push_back(vertex);
+    }
+
+    // Extract indices
+    for (uint32_t i = 0; i < mesh->mNumFaces; i++) {
+        aiFace face = mesh->mFaces[i];
+        for (uint32_t j = 0; j < face.mNumIndices; j++) {
+            result.indices.push_back(face.mIndices[j]);
+        }
+    }
+
+    result.indexCount = static_cast<uint32_t>(result.indices.size());
+
+    // Create GPU storage buffers for mesh shaders
+    // NOTE: Mesh shaders read from STORAGE_BUFFER, NOT VERTEX_BUFFER
+    if (!result.vertices.empty()) {
+        VkDeviceSize vertexBufferSize = sizeof(Vertex) * result.vertices.size();
+        createBuffer(vertexBufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    result.vertexBuffer, result.vertexBufferMemory);
+
+        copyDataToBuffer(result.vertexBufferMemory, result.vertices.data(), vertexBufferSize);
+    }
+
+    if (!result.indices.empty()) {
+        VkDeviceSize indexBufferSize = sizeof(uint32_t) * result.indices.size();
+        createBuffer(indexBufferSize,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    result.indexBuffer, result.indexBufferMemory);
+
+        copyDataToBuffer(result.indexBufferMemory, result.indices.data(), indexBufferSize);
+    }
+
+    // Create draw params buffer (indexCount, instanceCount)
+    struct DrawParams {
+        uint32_t indexCount;
+        uint32_t instanceCount;
+    };
+    DrawParams drawParams{result.indexCount, 1};
+
+    VkDeviceSize drawParamsSize = sizeof(DrawParams);
+    createBuffer(drawParamsSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                result.drawParamsBuffer, result.drawParamsBufferMemory);
+
+    copyDataToBuffer(result.drawParamsBufferMemory, &drawParams, drawParamsSize);
+
+    Logger::get().info("Processed mesh: {} vertices, {} indices", result.vertices.size(), result.indices.size());
+
+    return result;
+}
+
+// Helper function to recursively process Assimp nodes
+static void processNode(aiNode* node, const aiScene* scene, std::vector<Mesh>& meshes) {
+    // Process all the node's meshes
+    for (uint32_t i = 0; i < node->mNumMeshes; i++) {
+        aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
+        meshes.push_back(processMesh(mesh));
+    }
+
+    // Process children
+    for (uint32_t i = 0; i < node->mNumChildren; i++) {
+        processNode(node->mChildren[i], scene, meshes);
+    }
+}
+
+// Helper function to create depth buffer resources
+static int createDepthResources() {
+    // Create depth image
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = g_engine.swapchainExtent.width;
+    imageInfo.extent.height = g_engine.swapchainExtent.height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = g_engine.depthFormat;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(g_engine.device, &imageInfo, nullptr, &g_engine.depthImage) != VK_SUCCESS) {
+        Logger::get().error("Failed to create depth image");
+        return -1;
+    }
+
+    // Allocate memory for depth image
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(g_engine.device, g_engine.depthImage, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (vkAllocateMemory(g_engine.device, &allocInfo, nullptr, &g_engine.depthImageMemory) != VK_SUCCESS) {
+        Logger::get().error("Failed to allocate depth image memory");
+        vkDestroyImage(g_engine.device, g_engine.depthImage, nullptr);
+        g_engine.depthImage = nullptr;
+        return -1;
+    }
+
+    vkBindImageMemory(g_engine.device, g_engine.depthImage, g_engine.depthImageMemory, 0);
+
+    // Create depth image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = g_engine.depthImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = g_engine.depthFormat;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    if (vkCreateImageView(g_engine.device, &viewInfo, nullptr, &g_engine.depthImageView) != VK_SUCCESS) {
+        Logger::get().error("Failed to create depth image view");
+        vkFreeMemory(g_engine.device, g_engine.depthImageMemory, nullptr);
+        vkDestroyImage(g_engine.device, g_engine.depthImage, nullptr);
+        g_engine.depthImage = nullptr;
+        g_engine.depthImageMemory = nullptr;
+        return -1;
+    }
+
+    return 0;
+}
+
+// Helper function to destroy depth buffer resources
+static void destroyDepthResources() {
+    if (g_engine.depthImageView) {
+        vkDestroyImageView(g_engine.device, g_engine.depthImageView, nullptr);
+        g_engine.depthImageView = nullptr;
+    }
+    if (g_engine.depthImage) {
+        vkDestroyImage(g_engine.device, g_engine.depthImage, nullptr);
+        g_engine.depthImage = nullptr;
+    }
+    if (g_engine.depthImageMemory) {
+        vkFreeMemory(g_engine.device, g_engine.depthImageMemory, nullptr);
+        g_engine.depthImageMemory = nullptr;
+    }
+}
+
 // Helper function to recreate swapchain
 static int recreate_swapchain() {
 
@@ -351,8 +706,9 @@ static int recreate_swapchain() {
     g_engine.isRecreatingSwapchain = true;
     g_engine.resizeEventDuringRecreate = false;
 
-    // Wait for in-flight rendering to complete before destroying resources
-    vkWaitForFences(g_engine.device, MAX_FRAMES_IN_FLIGHT, g_engine.inFlightFences, VK_TRUE, UINT64_MAX);
+    // Wait for ALL device operations to complete (including presentation engine)
+    // This ensures semaphores are no longer in use before we destroy them
+    vkDeviceWaitIdle(g_engine.device);
 
     // Clean up old swapchain resources
     for (auto imageView : g_engine.swapchainImageViews) {
@@ -360,11 +716,14 @@ static int recreate_swapchain() {
     }
     g_engine.swapchainImageViews.clear();
 
-    // Clean up old per-image semaphores
-    for (auto sem : g_engine.renderFinishedSemaphores) {
-        vkDestroySemaphore(g_engine.device, sem, nullptr);
+    // Clean up old depth resources
+    destroyDepthResources();
+
+    // Clean up old per-frame-in-flight semaphores
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        vkDestroySemaphore(g_engine.device, g_engine.imageAvailableSemaphores[i], nullptr);
+        vkDestroySemaphore(g_engine.device, g_engine.renderFinishedSemaphores[i], nullptr);
     }
-    g_engine.renderFinishedSemaphores.clear();
 
     VkSwapchainKHR oldSwapchain = g_engine.swapchain;
 
@@ -401,6 +760,25 @@ static int recreate_swapchain() {
         imageCount = capabilities.maxImageCount;
     }
 
+    // Query available present modes (same as initial swapchain creation)
+    uint32_t presentModeCount;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_engine.physicalDevice, g_engine.surface, &presentModeCount, nullptr);
+    std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_engine.physicalDevice, g_engine.surface, &presentModeCount, presentModes.data());
+
+    // Prefer Immediate (uncapped framerate) for maximum performance, fallback to FIFO (guaranteed support)
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    for (const auto& mode : presentModes) {
+        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            Logger::get().info("Using Immediate present mode (uncapped framerate)");
+            break;
+        }
+    }
+    if (presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+        Logger::get().info("Using FIFO present mode (vsync fallback)");
+    }
+
     VkSwapchainCreateInfoKHR swapchainInfo{};
     swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     swapchainInfo.surface = g_engine.surface;
@@ -413,7 +791,7 @@ static int recreate_swapchain() {
     swapchainInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchainInfo.preTransform = capabilities.currentTransform;
     swapchainInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    swapchainInfo.presentMode = presentMode;
     swapchainInfo.clipped = VK_TRUE;
     swapchainInfo.oldSwapchain = oldSwapchain;
 
@@ -432,6 +810,10 @@ static int recreate_swapchain() {
     vkGetSwapchainImagesKHR(g_engine.device, g_engine.swapchain, &imageCount, nullptr);
     g_engine.swapchainImages.resize(imageCount);
     vkGetSwapchainImagesKHR(g_engine.device, g_engine.swapchain, &imageCount, g_engine.swapchainImages.data());
+
+    // Reset per-image fence tracking (no frame is using any image after recreation)
+    // Use assign() to clear ALL elements, not just resize which keeps old values if size unchanged
+    g_engine.imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
 
     // Recreate image views
     g_engine.swapchainImageViews.resize(imageCount);
@@ -458,22 +840,36 @@ static int recreate_swapchain() {
         }
     }
 
-    // Recreate per-image semaphores
+    // Recreate depth resources
+    if (createDepthResources() != 0) {
+        Logger::get().error("Failed to recreate depth resources");
+        g_engine.isRecreatingSwapchain = false;
+        return -1;
+    }
+
+    // Recreate per-frame-in-flight semaphores (both imageAvailable and renderFinished)
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
-    g_engine.renderFinishedSemaphores.resize(imageCount);
-    for (size_t i = 0; i < imageCount; i++) {
-        if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS) {
-            Logger::get().error("Failed to recreate render finished semaphore for image {}", i);
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.imageAvailableSemaphores[i]) != VK_SUCCESS ||
+            vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            Logger::get().error("Failed to recreate semaphores for frame {}", i);
             g_engine.isRecreatingSwapchain = false;
             return -1;
         }
     }
 
+    // Reset frame index to start fresh
+    g_engine.currentFrameIndex = 0;
+
+    // After vkDeviceWaitIdle, all fences are signaled but we need them in a known state
+    // Since we're resetting currentFrameIndex to 0, we should ensure fence[0] will work correctly
+    // Actually, let's leave fences as-is (signaled) and let normal flow handle them
+
     // Command buffers are per-frame-in-flight (MAX_FRAMES_IN_FLIGHT), not per-image, so no recreation needed
 
-    Logger::get().info("Swapchain recreated successfully!");
+    Logger::get().info("Swapchain recreated successfully! Frame index reset to 0");
 
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_engine.physicalDevice, g_engine.surface, &capabilities);
 
@@ -494,6 +890,177 @@ static int recreate_swapchain() {
     return 0;
 }
 
+// Render all models with the Model component
+void boulder_render_models() {
+    if (!g_engine.initialized || !g_engine.activeCommandBuffer || !g_engine.modelPipeline || !g_engine.ecs) {
+        return;
+    }
+
+    vkCmdBindPipeline(g_engine.activeCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_engine.modelPipeline);
+
+    // Ensure all storage buffer writes are visible to mesh shader reads
+    VkMemoryBarrier memoryBarrier{};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memoryBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        g_engine.activeCommandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT,
+        0,
+        1, &memoryBarrier,
+        0, nullptr,
+        0, nullptr
+    );
+
+    // Set dynamic viewport and scissor
+    boulder_set_viewport(0.0f, 0.0f, (float)g_engine.swapchainExtent.width, (float)g_engine.swapchainExtent.height, 0.0f, 1.0f);
+    boulder_set_scissor(0, 0, g_engine.swapchainExtent.width, g_engine.swapchainExtent.height);
+
+    // Set up view-projection matrix
+    float aspect = (float)g_engine.swapchainExtent.width / (float)g_engine.swapchainExtent.height;
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
+    proj[1][1] *= -1; // Flip Y for Vulkan
+
+    glm::mat4 view = glm::lookAt(
+        glm::vec3(2.0f, 2.0f, 2.0f),
+        glm::vec3(0.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f)
+    );
+
+    glm::mat4 viewProj = proj * view;
+
+    // Query all entities with Model and Transform components
+    auto query = g_engine.ecs->query_builder<const Model, const Transform>().build();
+
+    static bool logged = false;
+    int entityCount = 0;
+
+    query.each([&](flecs::entity e, const Model& model, const Transform& transform) {
+        entityCount++;
+        // Build model matrix from transform
+        glm::mat4 modelMatrix = glm::mat4(1.0f);
+        modelMatrix = glm::translate(modelMatrix, transform.position);
+        modelMatrix = glm::rotate(modelMatrix, transform.rotation.x, glm::vec3(1, 0, 0));
+        modelMatrix = glm::rotate(modelMatrix, transform.rotation.y, glm::vec3(0, 1, 0));
+        modelMatrix = glm::rotate(modelMatrix, transform.rotation.z, glm::vec3(0, 0, 1));
+        modelMatrix = glm::scale(modelMatrix, transform.scale);
+
+        // Render each mesh in the model
+        int meshIndex = 0;
+        for (const auto& mesh : model.meshes) {
+            if (!logged) {
+                Logger::get().info("Processing mesh {}: vbuf={:x} ibuf={:x} indices={}",
+                                  meshIndex, (uint64_t)mesh.vertexBuffer, (uint64_t)mesh.indexBuffer, mesh.indexCount);
+            }
+
+            if (mesh.vertexBuffer == VK_NULL_HANDLE || mesh.indexBuffer == VK_NULL_HANDLE) {
+                if (!logged) {
+                    Logger::get().error("Skipping mesh {} - null buffers!", meshIndex);
+                }
+                meshIndex++;
+                continue;
+            }
+
+            // Allocate descriptor set for this mesh from current frame's pool
+            VkDescriptorSetAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocInfo.descriptorPool = g_engine.modelDescriptorPools[g_engine.currentFrameIndex];
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &g_engine.modelDescriptorSetLayout;
+
+            VkDescriptorSet descriptorSet;
+            if (vkAllocateDescriptorSets(g_engine.device, &allocInfo, &descriptorSet) != VK_SUCCESS) {
+                Logger::get().error("Failed to allocate descriptor set for model mesh");
+                continue;
+            }
+
+            // Update descriptor set with storage buffer bindings
+            VkDescriptorBufferInfo vertexBufferInfo{};
+            vertexBufferInfo.buffer = mesh.vertexBuffer;
+            vertexBufferInfo.offset = 0;
+            vertexBufferInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorBufferInfo indexBufferInfo{};
+            indexBufferInfo.buffer = mesh.indexBuffer;
+            indexBufferInfo.offset = 0;
+            indexBufferInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorBufferInfo drawParamsInfo{};
+            drawParamsInfo.buffer = mesh.drawParamsBuffer;
+            drawParamsInfo.offset = 0;
+            drawParamsInfo.range = VK_WHOLE_SIZE;
+
+            VkWriteDescriptorSet descriptorWrites[3] = {};
+
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].dstSet = descriptorSet;
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[0].descriptorCount = 1;
+            descriptorWrites[0].pBufferInfo = &vertexBufferInfo;
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = descriptorSet;
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pBufferInfo = &indexBufferInfo;
+
+            descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[2].dstSet = descriptorSet;
+            descriptorWrites[2].dstBinding = 2;
+            descriptorWrites[2].dstArrayElement = 0;
+            descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[2].descriptorCount = 1;
+            descriptorWrites[2].pBufferInfo = &drawParamsInfo;
+
+            vkUpdateDescriptorSets(g_engine.device, 3, descriptorWrites, 0, nullptr);
+
+            // Bind descriptor set
+            vkCmdBindDescriptorSets(g_engine.activeCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                   g_engine.modelPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+
+            // Set push constants
+            struct ModelPushConstants {
+                glm::mat4 viewProj;
+                glm::mat4 model;
+                uint32_t vertexOffset;
+                uint32_t indexOffset;
+            } pushConstants;
+
+            pushConstants.viewProj = viewProj;
+            pushConstants.model = modelMatrix;
+            pushConstants.vertexOffset = 0;
+            pushConstants.indexOffset = 0;
+
+            vkCmdPushConstants(g_engine.activeCommandBuffer, g_engine.modelPipelineLayout,
+                             VK_SHADER_STAGE_MESH_BIT_EXT, 0, sizeof(ModelPushConstants), &pushConstants);
+
+            // Draw mesh with mesh shader
+            // Calculate workgroups needed (30 indices = 10 triangles per workgroup)
+            uint32_t numWorkgroups = (mesh.indexCount + 29) / 30;
+
+            if (!logged) {
+                Logger::get().info("Drawing mesh: {} indices, {} workgroups", mesh.indexCount, numWorkgroups);
+            }
+
+            vkCmdDrawMeshTasksEXT(g_engine.activeCommandBuffer, numWorkgroups, 1, 1);
+
+            meshIndex++;
+        }
+    });
+
+    // Debug log on first frame
+    if (!logged && entityCount > 0) {
+        Logger::get().info("Rendering {} entities with models", entityCount);
+        logged = true;
+    }
+}
+
 // Legacy function - use begin_frame/end_frame instead
 int boulder_render() {
     uint32_t imageIndex;
@@ -509,8 +1076,8 @@ int boulder_render() {
         return result;
     }
 
-    // Draw cube with mesh shader
-    if (g_engine.cubePipeline) {
+    // Draw cube with mesh shader (DISABLED for debugging model rendering)
+    if (false && g_engine.cubePipeline) {
         vkCmdBindPipeline(g_engine.activeCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_engine.cubePipeline);
 
         // Set dynamic viewport and scissor
@@ -519,7 +1086,7 @@ int boulder_render() {
 
         // Set up view-projection matrix (simple perspective)
         float aspect = (float)g_engine.swapchainExtent.width / (float)g_engine.swapchainExtent.height;
-        glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
+        glm::mat4 proj = glm::perspective(glm::radians(90.0f), aspect, 0.1f, 100.0f);
         proj[1][1] *= -1; // Flip Y for Vulkan
 
         glm::mat4 view = glm::lookAt(
@@ -549,6 +1116,12 @@ int boulder_render() {
         // Draw mesh shader (1 workgroup = 1 cube)
         vkCmdDrawMeshTasksEXT(g_engine.activeCommandBuffer, 1, 1, 1);
     }
+
+    // Render models
+    boulder_render_models();
+
+    // Render UI overlay on top of the scene
+    boulder_ui_render(imageIndex);
 
     return boulder_end_frame(imageIndex);
 }
@@ -651,7 +1224,24 @@ int boulder_create_window(int width, int height, const char* title) {
         return -1;
     }
 
-    // Mesh shader features
+    // Query mesh shader features to ensure they're actually supported
+    VkPhysicalDeviceMeshShaderFeaturesEXT queriedMeshShaderFeatures{};
+    queriedMeshShaderFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &queriedMeshShaderFeatures;
+
+    vkGetPhysicalDeviceFeatures2(g_engine.physicalDevice, &features2);
+
+    if (!queriedMeshShaderFeatures.meshShader) {
+        Logger::get().error("Mesh shader feature NOT supported on this device!");
+        return -1;
+    }
+
+    Logger::get().info("Mesh shader feature is supported!");
+
+    // Enable mesh shader features for device creation
     VkPhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures{};
     meshShaderFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
     meshShaderFeatures.meshShader = VK_TRUE;
@@ -715,6 +1305,25 @@ int boulder_create_window(int width, int height, const char* title) {
         imageCount = capabilities.maxImageCount;
     }
 
+    // Query available present modes
+    uint32_t presentModeCount;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_engine.physicalDevice, g_engine.surface, &presentModeCount, nullptr);
+    std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_engine.physicalDevice, g_engine.surface, &presentModeCount, presentModes.data());
+
+    // Prefer Immediate (uncapped framerate) for maximum performance, fallback to FIFO (guaranteed support)
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    for (const auto& mode : presentModes) {
+        if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            Logger::get().info("Using Immediate present mode (uncapped framerate)");
+            break;
+        }
+    }
+    if (presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+        Logger::get().info("Using FIFO present mode (vsync fallback)");
+    }
+
     VkSwapchainCreateInfoKHR swapchainInfo{};
     swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     swapchainInfo.surface = g_engine.surface;
@@ -727,7 +1336,7 @@ int boulder_create_window(int width, int height, const char* title) {
     swapchainInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchainInfo.preTransform = capabilities.currentTransform;
     swapchainInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    swapchainInfo.presentMode = presentMode;
     swapchainInfo.clipped = VK_TRUE;
 
     if (vkCreateSwapchainKHR(g_engine.device, &swapchainInfo, nullptr, &g_engine.swapchain) != VK_SUCCESS) {
@@ -738,6 +1347,9 @@ int boulder_create_window(int width, int height, const char* title) {
     vkGetSwapchainImagesKHR(g_engine.device, g_engine.swapchain, &imageCount, nullptr);
     g_engine.swapchainImages.resize(imageCount);
     vkGetSwapchainImagesKHR(g_engine.device, g_engine.swapchain, &imageCount, g_engine.swapchainImages.data());
+
+    // Initialize per-image fence tracking (initially no frame is using any image)
+    g_engine.imagesInFlight.resize(imageCount, VK_NULL_HANDLE);
 
     // Create image views
     g_engine.swapchainImageViews.resize(imageCount);
@@ -761,6 +1373,12 @@ int boulder_create_window(int width, int height, const char* title) {
             Logger::get().error("Failed to create image view");
             return -1;
         }
+    }
+
+    // Create depth resources
+    if (createDepthResources() != 0) {
+        Logger::get().error("Failed to create depth resources");
+        return -1;
     }
 
     // Create command pool
@@ -795,20 +1413,12 @@ int boulder_create_window(int width, int height, const char* title) {
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    // Per-frame-in-flight sync (imageAvailable and fences)
+    // Per-frame-in-flight sync (imageAvailable, renderFinished, and fences)
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.imageAvailableSemaphores[i]) != VK_SUCCESS ||
+            vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(g_engine.device, &fenceInfo, nullptr, &g_engine.inFlightFences[i]) != VK_SUCCESS) {
             Logger::get().error("Failed to create sync objects for frame {}", i);
-            return -1;
-        }
-    }
-
-    // Per-swapchain-image semaphores (renderFinished - used by present)
-    g_engine.renderFinishedSemaphores.resize(imageCount);
-    for (size_t i = 0; i < imageCount; i++) {
-        if (vkCreateSemaphore(g_engine.device, &semaphoreInfo, nullptr, &g_engine.renderFinishedSemaphores[i]) != VK_SUCCESS) {
-            Logger::get().error("Failed to create render finished semaphore for image {}", i);
             return -1;
         }
     }
@@ -901,8 +1511,8 @@ int boulder_create_window(int width, int height, const char* title) {
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; 
+    rasterizer.cullMode = VK_CULL_MODE_NONE;  // Disable culling for debugging
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
@@ -919,10 +1529,20 @@ int boulder_create_window(int width, int height, const char* title) {
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
 
+    // Depth stencil state
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
+
     VkPipelineRenderingCreateInfo pipelineRenderingInfo{};
     pipelineRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     pipelineRenderingInfo.colorAttachmentCount = 1;
     pipelineRenderingInfo.pColorAttachmentFormats = &g_engine.swapchainFormat;
+    pipelineRenderingInfo.depthAttachmentFormat = g_engine.depthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -933,6 +1553,7 @@ int boulder_create_window(int width, int height, const char* title) {
     pipelineInfo.pRasterizationState = &rasterizer;
     pipelineInfo.pMultisampleState = &multisampling;
     pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = g_engine.pipelineLayout;
 
@@ -942,6 +1563,138 @@ int boulder_create_window(int width, int height, const char* title) {
     }
 
     Logger::get().info("Vulkan rendering setup complete!");
+
+    // Create model rendering pipeline for loaded geometry
+    Logger::get().info("Creating model rendering pipeline...");
+
+    // Load model shaders
+    std::ifstream modelMeshFile("shaders/model.mesh");
+    std::string modelMeshSource((std::istreambuf_iterator<char>(modelMeshFile)), std::istreambuf_iterator<char>());
+
+    std::ifstream modelFragFile("shaders/model.frag");
+    std::string modelFragSource((std::istreambuf_iterator<char>(modelFragFile)), std::istreambuf_iterator<char>());
+
+    if (!modelMeshSource.empty() && !modelFragSource.empty()) {
+        auto modelMeshSpirv = compileShader(modelMeshSource, shaderc_glsl_default_mesh_shader, "model.mesh");
+        auto modelFragSpirv = compileShader(modelFragSource, shaderc_glsl_default_fragment_shader, "model.frag");
+
+        if (!modelMeshSpirv.empty() && !modelFragSpirv.empty()) {
+            // Create shader modules
+            VkShaderModuleCreateInfo meshModuleInfo{};
+            meshModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            meshModuleInfo.codeSize = modelMeshSpirv.size() * sizeof(uint32_t);
+            meshModuleInfo.pCode = modelMeshSpirv.data();
+            vkCreateShaderModule(g_engine.device, &meshModuleInfo, nullptr, &g_engine.modelMeshShader);
+
+            VkShaderModuleCreateInfo fragModuleInfo{};
+            fragModuleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fragModuleInfo.codeSize = modelFragSpirv.size() * sizeof(uint32_t);
+            fragModuleInfo.pCode = modelFragSpirv.data();
+            vkCreateShaderModule(g_engine.device, &fragModuleInfo, nullptr, &g_engine.modelFragShader);
+
+            // Create descriptor set layout for storage buffers
+            VkDescriptorSetLayoutBinding bindings[3] = {};
+
+            // Binding 0: Vertex buffer (SSBO)
+            bindings[0].binding = 0;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[0].descriptorCount = 1;
+            bindings[0].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+
+            // Binding 1: Index buffer (SSBO)
+            bindings[1].binding = 1;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[1].descriptorCount = 1;
+            bindings[1].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+
+            // Binding 2: Draw params (SSBO)
+            bindings[2].binding = 2;
+            bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[2].descriptorCount = 1;
+            bindings[2].stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+
+            VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo{};
+            descriptorLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            descriptorLayoutInfo.bindingCount = 3;
+            descriptorLayoutInfo.pBindings = bindings;
+            vkCreateDescriptorSetLayout(g_engine.device, &descriptorLayoutInfo, nullptr, &g_engine.modelDescriptorSetLayout);
+
+            // Create pipeline layout with push constants
+            VkPushConstantRange modelPushConstant{};
+            modelPushConstant.stageFlags = VK_SHADER_STAGE_MESH_BIT_EXT;
+            modelPushConstant.offset = 0;
+            modelPushConstant.size = sizeof(glm::mat4) * 2 + sizeof(uint32_t) * 2; // viewProj + model + 2 offsets
+
+            VkPipelineLayoutCreateInfo modelLayoutInfo{};
+            modelLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            modelLayoutInfo.setLayoutCount = 1;
+            modelLayoutInfo.pSetLayouts = &g_engine.modelDescriptorSetLayout;
+            modelLayoutInfo.pushConstantRangeCount = 1;
+            modelLayoutInfo.pPushConstantRanges = &modelPushConstant;
+            vkCreatePipelineLayout(g_engine.device, &modelLayoutInfo, nullptr, &g_engine.modelPipelineLayout);
+
+            // Create model pipeline (similar to cube pipeline but with descriptor sets)
+            VkPipelineShaderStageCreateInfo modelShaderStages[2] = {};
+            modelShaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            modelShaderStages[0].stage = VK_SHADER_STAGE_MESH_BIT_EXT;
+            modelShaderStages[0].module = g_engine.modelMeshShader;
+            modelShaderStages[0].pName = "main";
+
+            modelShaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            modelShaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            modelShaderStages[1].module = g_engine.modelFragShader;
+            modelShaderStages[1].pName = "main";
+
+            VkGraphicsPipelineCreateInfo modelPipelineInfo{};
+            modelPipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            modelPipelineInfo.pNext = &pipelineRenderingInfo;
+            modelPipelineInfo.stageCount = 2;
+            modelPipelineInfo.pStages = modelShaderStages;
+            modelPipelineInfo.pViewportState = &viewportState;
+            modelPipelineInfo.pRasterizationState = &rasterizer;
+            modelPipelineInfo.pMultisampleState = &multisampling;
+            modelPipelineInfo.pColorBlendState = &colorBlending;
+            modelPipelineInfo.pDepthStencilState = &depthStencil;
+            modelPipelineInfo.pDynamicState = &dynamicState;
+            modelPipelineInfo.layout = g_engine.modelPipelineLayout;
+
+            if (vkCreateGraphicsPipelines(g_engine.device, nullptr, 1, &modelPipelineInfo, nullptr, &g_engine.modelPipeline) == VK_SUCCESS) {
+                Logger::get().info("✓ Model rendering pipeline created");
+
+                // Create descriptor pools for model rendering (one per frame-in-flight)
+                // Support up to 1000 descriptor sets with 3 storage buffers each per pool
+                VkDescriptorPoolSize poolSize{};
+                poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                poolSize.descriptorCount = 3000; // 1000 sets * 3 bindings
+
+                VkDescriptorPoolCreateInfo poolInfo{};
+                poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+                poolInfo.poolSizeCount = 1;
+                poolInfo.pPoolSizes = &poolSize;
+                poolInfo.maxSets = 1000;
+
+                for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+                    if (vkCreateDescriptorPool(g_engine.device, &poolInfo, nullptr, &g_engine.modelDescriptorPools[i]) != VK_SUCCESS) {
+                        Logger::get().error("Failed to create model descriptor pool {}", i);
+                    }
+                }
+                Logger::get().info("✓ Model descriptor pools created ({} pools)", MAX_FRAMES_IN_FLIGHT);
+            } else {
+                Logger::get().error("Failed to create model pipeline");
+            }
+        } else {
+            Logger::get().warning("Model shaders not compiled - model rendering disabled");
+        }
+    } else {
+        Logger::get().warning("Model shader files not found - model rendering disabled");
+    }
+
+    // Initialize UI system now that all Vulkan resources are ready
+    if (boulder_ui_init() != 0) {
+        Logger::get().error("Failed to initialize UI system (non-fatal)");
+        // Don't fail window creation if UI init fails
+    }
 
     return g_engine.window ? 0 : -1;
 
@@ -1046,6 +1799,56 @@ int boulder_get_transform(EntityID entity, float* x, float* y, float* z) {
     return 0;
 }
 
+int boulder_get_full_transform(EntityID entity,
+                               float* px, float* py, float* pz,
+                               float* rx, float* ry, float* rz,
+                               float* sx, float* sy, float* sz) {
+    if (!g_engine.ecs) {
+        return -1;
+    }
+
+    flecs::entity e = g_engine.ecs->entity(entity);
+    const Transform* t = e.get<Transform>();
+    if (!t) {
+        return -1;
+    }
+
+    if (px) *px = t->position.x;
+    if (py) *py = t->position.y;
+    if (pz) *pz = t->position.z;
+
+    if (rx) *rx = t->rotation.x;
+    if (ry) *ry = t->rotation.y;
+    if (rz) *rz = t->rotation.z;
+
+    if (sx) *sx = t->scale.x;
+    if (sy) *sy = t->scale.y;
+    if (sz) *sz = t->scale.z;
+
+    return 0;
+}
+
+int boulder_set_full_transform(EntityID entity,
+                              float px, float py, float pz,
+                              float rx, float ry, float rz,
+                              float sx, float sy, float sz) {
+    if (!g_engine.ecs) {
+        return -1;
+    }
+
+    flecs::entity e = g_engine.ecs->entity(entity);
+    Transform* t = e.get_mut<Transform>();
+    if (!t) {
+        return -1;
+    }
+
+    t->position = glm::vec3(px, py, pz);
+    t->rotation = glm::vec3(rx, ry, rz);
+    t->scale = glm::vec3(sx, sy, sz);
+
+    return 0;
+}
+
 int boulder_set_transform(EntityID entity, float x, float y, float z) {
     if (!g_engine.ecs) {
         return -1;
@@ -1130,21 +1933,61 @@ int boulder_apply_force(EntityID entity, float fx, float fy, float fz) {
 
 int boulder_load_model(EntityID entity, const char* path) {
     if (!g_engine.ecs || !g_engine.importer || !path) {
+        Logger::get().error("Invalid parameters for loading model");
         return -1;
     }
 
+    if (!g_engine.device) {
+        Logger::get().error("Cannot load model: Vulkan device not initialized");
+        return -1;
+    }
+
+    Logger::get().info("Loading model: {}", path);
+
     const aiScene* scene = g_engine.importer->ReadFile(path,
-        aiProcess_Triangulate | aiProcess_FlipUVs | aiProcess_CalcTangentSpace);
+        aiProcess_Triangulate |
+        aiProcess_FlipUVs |
+        aiProcess_JoinIdenticalVertices);
 
     if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode) {
+        Logger::get().error("Failed to load model: {}", g_engine.importer->GetErrorString());
         return -1;
+    }
+
+    // Process all meshes in the scene
+    Model model;
+    model.path = std::string(path);
+    model.scene = scene;
+    processNode(scene->mRootNode, scene, model.meshes);
+
+    Logger::get().info("✓ Model loaded: {} meshes extracted", model.meshes.size());
+
+    // Debug: Print mesh statistics
+    for (size_t i = 0; i < model.meshes.size(); i++) {
+        const auto& mesh = model.meshes[i];
+        Logger::get().info("  Mesh {}: {} vertices, {} indices",
+                          i, mesh.vertices.size(), mesh.indexCount);
+
+        // Debug: Print first few indices to verify they're in range
+        if (mesh.indices.size() >= 10) {
+            Logger::get().info("    First 10 indices: {} {} {} {} {} {} {} {} {} {}",
+                              mesh.indices[0], mesh.indices[1], mesh.indices[2],
+                              mesh.indices[3], mesh.indices[4], mesh.indices[5],
+                              mesh.indices[6], mesh.indices[7], mesh.indices[8],
+                              mesh.indices[9]);
+        } else if (!mesh.indices.empty()) {
+            Logger::get().info("    All {} indices loaded", mesh.indices.size());
+        }
     }
 
     flecs::entity e = g_engine.ecs->entity(entity);
-    e.set<Model>({
-        .path = std::string(path),
-        .scene = scene
-    });
+    e.set<Model>(std::move(model));
+
+    // Ensure buffer writes are visible to GPU before rendering
+    // Even with HOST_COHERENT memory, we need an execution dependency
+    vkDeviceWaitIdle(g_engine.device);
+
+    Logger::get().info("Model buffers synchronized with GPU");
 
     return 0;
 }
@@ -1316,6 +2159,15 @@ PipelineID boulder_create_graphics_pipeline(ShaderModuleID meshShader, ShaderMod
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
 
+    // Depth stencil state
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
+
     // Dynamic state
     VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT,
@@ -1338,6 +2190,7 @@ PipelineID boulder_create_graphics_pipeline(ShaderModuleID meshShader, ShaderMod
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachmentFormats = &g_engine.swapchainFormat;
+    renderingInfo.depthAttachmentFormat = g_engine.depthFormat;
 
     // Create graphics pipeline
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -1348,6 +2201,7 @@ PipelineID boulder_create_graphics_pipeline(ShaderModuleID meshShader, ShaderMod
     pipelineInfo.pRasterizationState = &rasterizer;
     pipelineInfo.pMultisampleState = &multisampling;
     pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.pViewportState = &viewportState;
     pipelineInfo.layout = pipelineLayout;
@@ -1414,14 +2268,15 @@ int boulder_begin_frame(uint32_t* imageIndex) {
     }
 
     if (g_engine.swapchainNeedsRecreate) {
-        Logger::get().info("Swapchain recreation needed before beginning frame");
+        Logger::get().info("SWAPCHAIN NEEDS RECREATION. Recreating...");
         return -2;
     }
+
 
     // Wait for the fence for this frame
     vkWaitForFences(g_engine.device, 1, &g_engine.inFlightFences[g_engine.currentFrameIndex], VK_TRUE, UINT64_MAX);
 
-    // Acquire next image
+    // Acquire next image (before resetting fence, in case acquisition fails)
     VkResult result = vkAcquireNextImageKHR(
         g_engine.device,
         g_engine.swapchain,
@@ -1435,12 +2290,26 @@ int boulder_begin_frame(uint32_t* imageIndex) {
         g_engine.swapchainNeedsRecreate = true;
         return -2;
     } else if (result != VK_SUCCESS) {
-        Logger::get().error("Failed to acquire swapchain image");
+        Logger::get().error("Failed to acquire swapchain image: {}", (int)result);
         return -1;
     }
 
-    // Reset fence
+    // CRITICAL: Check if this swapchain image is still being used BEFORE resetting our fence
+    // If the image is assigned to our own fence from a previous cycle, we must wait for it to signal first
+    if (g_engine.imagesInFlight[*imageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(g_engine.device, 1, &g_engine.imagesInFlight[*imageIndex], VK_TRUE, UINT64_MAX);
+    }
+
+    // Now safe to reset our fence (after waiting for any previous use)
     vkResetFences(g_engine.device, 1, &g_engine.inFlightFences[g_engine.currentFrameIndex]);
+
+    // Mark this image as now being used by this frame's fence (BEFORE we start using it)
+    g_engine.imagesInFlight[*imageIndex] = g_engine.inFlightFences[g_engine.currentFrameIndex];
+
+    // Reset descriptor pool for THIS FRAME's model rendering
+    if (g_engine.modelDescriptorPools[g_engine.currentFrameIndex]) {
+        vkResetDescriptorPool(g_engine.device, g_engine.modelDescriptorPools[g_engine.currentFrameIndex], 0);
+    }
 
     // Begin command buffer
     VkCommandBuffer cmd = g_engine.commandBuffers[g_engine.currentFrameIndex];
@@ -1458,10 +2327,10 @@ int boulder_begin_frame(uint32_t* imageIndex) {
         return -1;
     }
 
-    // Transition image layout
+    // Transition image layout from PRESENT_SRC (or UNDEFINED on first frame, which is compatible)
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1474,8 +2343,27 @@ int boulder_begin_frame(uint32_t* imageIndex) {
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Transition depth image to depth attachment optimal
+    VkImageMemoryBarrier depthBarrier{};
+    depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    depthBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthBarrier.image = g_engine.depthImage;
+    depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthBarrier.subresourceRange.baseMipLevel = 0;
+    depthBarrier.subresourceRange.levelCount = 1;
+    depthBarrier.subresourceRange.baseArrayLayer = 0;
+    depthBarrier.subresourceRange.layerCount = 1;
+    depthBarrier.srcAccessMask = 0;
+    depthBarrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &depthBarrier);
 
     // Begin rendering
     VkRenderingAttachmentInfo colorAttachment{};
@@ -1486,6 +2374,14 @@ int boulder_begin_frame(uint32_t* imageIndex) {
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachment.clearValue.color = g_engine.clearColor;
 
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView = g_engine.depthImageView;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.clearValue.depthStencil = {1.0f, 0};
+
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     renderingInfo.renderArea.offset = {0, 0};
@@ -1493,6 +2389,7 @@ int boulder_begin_frame(uint32_t* imageIndex) {
     renderingInfo.layerCount = 1;
     renderingInfo.colorAttachmentCount = 1;
     renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
 
     vkCmdBeginRendering(cmd, &renderingInfo);
 
@@ -1546,13 +2443,15 @@ int boulder_end_frame(uint32_t imageIndex) {
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    // Use imageIndex for renderFinished (per-swapchain-image, not per-frame)
-    VkSemaphore signalSemaphores[] = {g_engine.renderFinishedSemaphores[imageIndex]};
+    // Signal renderFinished semaphore for this frame-in-flight
+    VkSemaphore signalSemaphores[] = {g_engine.renderFinishedSemaphores[g_engine.currentFrameIndex]};
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
 
-    if (vkQueueSubmit(g_engine.graphicsQueue, 1, &submitInfo, g_engine.inFlightFences[g_engine.currentFrameIndex]) != VK_SUCCESS) {
-        Logger::get().error("Failed to submit draw command buffer");
+    auto res = vkQueueSubmit(g_engine.graphicsQueue, 1, &submitInfo, g_engine.inFlightFences[g_engine.currentFrameIndex]);
+
+    if (res != VK_SUCCESS) {
+        Logger::get().error("Failed to submit draw command buffer: {}", (int)res);
         g_engine.activeCommandBuffer = nullptr;
         return -1;
     }
